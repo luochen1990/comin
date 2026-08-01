@@ -1,7 +1,17 @@
 // 职责边界: comin desktop 子命令入口.
-// 把 comin 事件流转换为桌面通知: 部署/构建的关键阶段推送一条常驻交互式通知,
-// 在 confirmation 阶段(auto/manual 模式)提供"立即部署/跳过本次"双按钮, auto 模式下展示倒计时.
-// without 模式走原有瞬时通知路径.
+// 把一次部署周期(build→confirm→deploy→finished)的事件流转换为一条常驻通知, body 随阶段推进
+// 原地刷新(replaces_id); confirmation 阶段在 auto/manual 模式下追加双按钮 + 倒计时.
+// 部署外的独立事件(suspend/resume/reboot)走瞬时通知.
+//
+// 生命周期(场景 A: BuildConfirmer=without, DeployConfirmer=auto):
+//
+//	BuildStarted        → 开常驻, body="正在构建 origin/main", 无按钮
+//	BuildFinished(built)→ 静默(等 confirm)
+//	ConfirmationSubmitted(auto) → 刷新常驻, 追加按钮 + 倒计时行
+//	ConfirmationConfirmed       → 停 ticker, 通知保留
+//	DeploymentStarted  → 刷新常驻, body="正在部署", 去按钮
+//	DeploymentFinished → 刷新常驻, body="部署完成", 去按钮; 由 doneTimer 延迟关闭
+//	下一周期 BuildStarted → replaces_id 复用同一条通知(或上一条已被 doneTimer 关闭则新开)
 package cmd
 
 import (
@@ -29,43 +39,42 @@ import (
 // 新增语言只需往这张表加条目, 翻译查找逻辑无需改动.
 var translations = map[string]map[string]string{
 	"zh_CN": {
-		"started":         "Agent 桌面通知已启动.",
 		"suspended":       "Agent 已挂起.",
 		"resumed":         "Agent 已恢复.",
 		"eval_failed":     "评估失败.",
-		"build_running":   "正在构建来自 %s/%s 的新提交.",
 		"build_failed":    "构建失败.",
-		"deploy_started":  "一次部署已开始.",
-		"deploy_done":     "部署已完成.",
-		"deploy_failed":   "部署失败.",
 		"reboot_required": "需要重启机器以使本次部署生效.",
 		"cancelled":       "部署已被取消.",
-		// 常驻通知专用
+		// 常驻通知阶段文案(同一通知 body 随阶段刷新)
+		"phase_building":  "正在构建来自 %s/%s 的新提交.",
+		"phase_waiting":   "构建完成, 等待确认.",
+		"phase_deploying": "正在部署新版本.",
+		"phase_done":      "部署已完成.",
+		"phase_failed":    "部署失败.",
+		// 常驻通知交互元素
 		"deploy_now":      "立即部署",
 		"skip":            "跳过本次",
 		"countdown":       "剩余 %d 秒后自动放行",
 		"waiting_confirm": "等待你的确认",
-		"phase_building":  "正在构建新版本",
-		"phase_deploying": "正在部署新版本",
 	},
 	"en": {
-		"started":         "Agent desktop notifications started.",
 		"suspended":       "The agent is suspended.",
 		"resumed":         "The agent is resumed.",
 		"eval_failed":     "The evaluation has failed.",
-		"build_running":   "A new commit from %s/%s is building.",
 		"build_failed":    "The build has failed.",
-		"deploy_started":  "A deployment started.",
-		"deploy_done":     "The deployment is finished.",
-		"deploy_failed":   "The deployment has failed.",
 		"reboot_required": "The machine needs to be rebooted to take the deployment into account.",
 		"cancelled":       "The deployment has been cancelled.",
+		// Persistent notification phase strings (body refreshes as phase advances)
+		"phase_building":  "A new commit from %s/%s is building.",
+		"phase_waiting":   "Build finished, awaiting confirmation.",
+		"phase_deploying": "Deploying the new generation.",
+		"phase_done":      "The deployment is finished.",
+		"phase_failed":    "The deployment has failed.",
+		// Persistent notification interactive elements
 		"deploy_now":      "Deploy now",
 		"skip":            "Skip this time",
 		"countdown":       "Auto-confirming in %d seconds",
 		"waiting_confirm": "Waiting for your confirmation",
-		"phase_building":  "Building a new generation",
-		"phase_deploying": "Deploying the new generation",
 	},
 }
 
@@ -118,6 +127,9 @@ type notificationState struct {
 	conn     *dbus.Conn
 	// currentID != 0 表示有一条活跃的常驻通知, 后续 SendNotification 用 ReplacesID 原地刷新.
 	currentID uint32
+	// cycle 是部署周期号, 每次 BuildStarted 递增. 用于 doneTimer 回调跨周期身份校验:
+	// 通知 daemon 对 replaces_id 返回相同 id, 故不能仅靠 currentID 区分本周期/下一周期.
+	cycle uint64
 	// 持续刷新时使用的通知字段(每次刷新重新构造, 因 body 会随阶段/倒计时变化).
 	summary string
 	scope   string // "build" / "deploy" - 决定 Confirm 的 for 字段
@@ -126,12 +138,17 @@ type notificationState struct {
 	deadline time.Time
 	ticker   *time.Ticker
 	stopCh   chan struct{} // 通知 ticker goroutine 退出
+	// doneTimer: 部署完成后延迟关闭常驻通知(让用户看到"部署完成"结果再消失).
+	doneTimer *time.Timer
 	// persistentMessage 是"基础文案"(phase_building/phase_deploying 等),
 	// 刷新时 body = persistentMessage, auto 模式再追加倒计时行.
 	persistentMessage string
 }
 
 const countdownInterval = 5 * time.Second
+
+// doneDisplayDuration: 部署完成后常驻通知保留展示的时间, 超过后自动关闭.
+const doneDisplayDuration = 8 * time.Second
 
 // showOrUpdate 发送/刷新常驻通知. actions 为 nil 时不带按钮(纯进度展示).
 // 调用者必须持有 s.mu.
@@ -155,11 +172,17 @@ func (s *notificationState) showOrUpdateLocked(body string, actions []notify.Act
 	s.currentID = id
 }
 
-// close 关闭常驻通知并停止倒计时 goroutine. 幂等.
+// close 关闭常驻通知并停止所有后台 goroutine(倒计时 + 延迟关闭). 幂等.
 func (s *notificationState) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.stopTickerLocked()
+	s.stopBackgroundTimersLocked()
+	s.closeLocked()
+}
+
+// closeLocked 关闭当前常驻通知并重置状态字段. 必须持有 s.mu.
+// 不触碰 ticker/doneTimer —— 由调用方按场景决定是否先 stop(见 close / doneTimer 回调).
+func (s *notificationState) closeLocked() {
 	if s.currentID != 0 && s.notifier != nil {
 		if _, err := s.notifier.CloseNotification(s.currentID); err != nil {
 			logrus.Debugf("desktop: close notification %d failed: %s", s.currentID, err)
@@ -169,6 +192,13 @@ func (s *notificationState) close() {
 	s.uuid = ""
 	s.scope = ""
 	s.persistentMessage = ""
+}
+
+// stopBackgroundTimersLocked 停止所有后台定时器(倒计时 + 延迟关闭).
+// 阶段切换/通知关闭前调用, 必须持有 s.mu.
+func (s *notificationState) stopBackgroundTimersLocked() {
+	s.stopTickerLocked()
+	s.stopDoneTimerLocked()
 }
 
 // stopTickerLocked 停止倒计时 goroutine, 必须持有 s.mu.
@@ -182,6 +212,14 @@ func (s *notificationState) stopTickerLocked() {
 		}
 		s.ticker = nil
 		s.stopCh = nil
+	}
+}
+
+// stopDoneTimerLocked 停止延迟关闭 timer, 必须持有 s.mu.
+func (s *notificationState) stopDoneTimerLocked() {
+	if s.doneTimer != nil {
+		s.doneTimer.Stop()
+		s.doneTimer = nil
 	}
 }
 
@@ -265,8 +303,9 @@ func runDesktop(cmd *cobra.Command, args []string) {
 			// 用户手动关闭通知时, 同步清理内部状态(避免 currentID 指向已失效通知).
 			state.mu.Lock()
 			if sig.ID == state.currentID {
-				state.stopTickerLocked()
-				state.currentID = 0
+				// 复用 closeLocked: CloseNotification 对已关闭 id 是 no-op(仅刷 Debug 日志).
+				state.stopBackgroundTimersLocked()
+				state.closeLocked()
 			}
 			state.mu.Unlock()
 		}),
@@ -282,16 +321,6 @@ func runDesktop(cmd *cobra.Command, args []string) {
 		notifier.Close()
 		conn.Close()
 	}()
-
-	// 启动横幅: Warn 级别, 不阻塞(沿用现有降级策略).
-	if _, err := notify.SendNotification(conn, notify.Notification{
-		AppName:       "comin",
-		Summary:       title,
-		Body:          tr("started"),
-		ExpireTimeout: notify.ExpireTimeoutSetByNotificationServer,
-	}); err != nil {
-		logrus.Warnf("desktop: failed to send startup banner: %s", err)
-	}
 
 	test, _ := cmd.Flags().GetBool("test")
 	if test {
@@ -361,8 +390,9 @@ func makeOnAction(state *notificationState, clientPtr *client.Client) func(*noti
 
 // --- 事件处理 ---
 
-// handler 把一条事件转换为通知行为(瞬时 / 刷新常驻 / 开启常驻 / 关闭常驻).
-// persistent 活跃期间, 进度类事件刷新常驻通知 body; 否则走瞬时通知.
+// handler 把一条事件转换为通知行为.
+// 常驻通知生命周期对齐到一次部署周期: BuildStarted 开启, body 随阶段原地刷新,
+// DeploymentFinished 展示结果后延迟关闭. 部署外事件(suspend/resume/reboot)走瞬时通知.
 func handler(event *protobuf.Event, state *notificationState, c *client.Client) {
 	logrus.Debugf("received event: %s", event)
 	switch v := event.Type.(type) {
@@ -380,7 +410,7 @@ func handler(event *protobuf.Event, state *notificationState, c *client.Client) 
 		case "failed":
 			sendTransient(state, tr("eval_failed"))
 		case "evaluated":
-			// 成功评估, 等待 build 事件再通知
+			// 成功评估, 等待 build 事件
 		default:
 			logrus.Errorf("unexpected evaluation status: %s", g.EvalStatus)
 		}
@@ -389,65 +419,78 @@ func handler(event *protobuf.Event, state *notificationState, c *client.Client) 
 		if g.BuildReason != builder.BuildReasonNeedBuild {
 			break
 		}
-		msg := tr("build_running", g.SelectedRemoteName, g.SelectedBranchName)
+		// 开启(或复用)常驻通知, 进入构建阶段. 无按钮.
+		msg := tr("phase_building", g.SelectedRemoteName, g.SelectedBranchName)
 		state.mu.Lock()
 		defer state.mu.Unlock()
-		if state.currentID == 0 {
-			// 无活跃常驻通知(without 模式): 走瞬时路径
-			sendTransient(state, msg)
-			return
-		}
-		// 常驻通知活跃: 刷新 body 展示构建阶段
-		state.scope = "build"
-		state.uuid = g.Uuid
+		state.cycle++                      // 新周期: 递增周期号, 使上一周期的 doneTimer 回调身份校验失效
+		state.stopBackgroundTimersLocked() // 取消上一周期的延迟关闭/残留 ticker
+		state.scope = ""
+		state.uuid = ""
 		state.persistentMessage = msg
-		state.showOrUpdateLocked(msg, persistentActions())
+		state.showOrUpdateLocked(msg, nil)
 	case *protobuf.Event_BuildFinishedType:
 		g := v.BuildFinishedType.Generation
 		switch g.BuildStatus {
 		case "failed":
+			// 构建失败: 关闭常驻通知, 发瞬时提示.
+			state.close()
 			sendTransient(state, tr("build_failed"))
 		case "built":
-			// 构建完成, 等待 confirmation/deploy 事件
+			// 构建完成, 等待 confirmation/deploy 事件.
+			// DeployConfirmer=without: 主进程立即放行, 紧接着 DeploymentStarted 会刷新 body.
+			// DeployConfirmer=auto/manual: ConfirmationSubmitted 会追加按钮/倒计时.
 		default:
 			logrus.Errorf("unexpected build status: %s", g.BuildStatus)
 		}
 	case *protobuf.Event_DeploymentStartedType:
-		msg := tr("deploy_started")
+		// 刷新常驻为部署阶段, 去按钮(confirmation 已结束).
 		state.mu.Lock()
 		defer state.mu.Unlock()
-		if state.currentID == 0 {
-			// 无活跃常驻通知(without 模式): 走瞬时路径
-			sendTransient(state, msg)
-			return
-		}
-		// 常驻通知活跃(confirmation 刚结束): 刷新为部署阶段, 去掉按钮
+		state.stopBackgroundTimersLocked()
 		state.persistentMessage = tr("phase_deploying")
-		state.stopTickerLocked()
 		state.showOrUpdateLocked(state.persistentMessage, nil)
 	case *protobuf.Event_DeploymentFinishedType:
 		d := v.DeploymentFinishedType.Deployment
 		var msg string
 		switch d.Status {
 		case "done":
-			msg = tr("deploy_done")
+			msg = tr("phase_done")
 		case "failed":
-			msg = tr("deploy_failed")
+			msg = tr("phase_failed")
 		default:
 			logrus.Errorf("unexpected deployment status: %s", d.Status)
 		}
-		if msg != "" {
-			// 部署结束, 常驻通知使命完成, 关闭之; 然后发瞬时结果通知.
-			state.close()
-			sendTransient(state, msg)
+		if msg == "" {
+			break
 		}
+		// 部署结束: 在原常驻通知上更新结果(去按钮), 由 doneTimer 延迟关闭.
+		// 不发额外瞬时通知 —— 常驻通知本身就展示了结果.
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		state.stopBackgroundTimersLocked()
+		state.persistentMessage = msg
+		state.showOrUpdateLocked(msg, nil)
+		// 捕获周期号快照, 回调触发时校验防止跨周期误关(字段语义见 notificationState.cycle 注释).
+		// doneTimer.Stop 对已启动的回调返回 false 且不中断, 必须靠身份校验兜底.
+		expectedCycle := state.cycle
+		state.doneTimer = time.AfterFunc(doneDisplayDuration, func() {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if state.cycle != expectedCycle {
+				// 已进入下一周期(BuildStarted 递增了 cycle), 回调作废.
+				return
+			}
+			state.closeLocked()
+			state.doneTimer = nil
+		})
 	case *protobuf.Event_RebootRequired_:
 		sendTransient(state, tr("reboot_required"))
 	// 高频/内部事件: 静默(空 case 避免 default 分支错误日志刷屏)
 	case *protobuf.Event_ManagerState_:
 	case *protobuf.Event_Fetched_:
 	case *protobuf.Event_Log_:
-	// --- confirmation 生命周期: 决定是否开启/关闭常驻通知 ---
+	// --- confirmation 生命周期: 在已活跃的常驻通知上追加交互 ---
 	case *protobuf.Event_ConfirmationSubmittedType:
 		handleConfirmationSubmitted(v.ConfirmationSubmittedType, event.GetCreatedAt(), state, c)
 	case *protobuf.Event_ConfirmationConfirmedType:
@@ -462,17 +505,19 @@ func handler(event *protobuf.Event, state *notificationState, c *client.Client) 
 	}
 }
 
-// handleConfirmationSubmitted 处理 confirmation 提交事件, 决定是否开启常驻通知.
-//   - without: 立即放行, 不弹常驻通知(走瞬时路径).
-//   - auto:    弹常驻通知 + 双按钮 + 倒计时.
-//   - manual:  弹常驻通知 + 双按钮(无倒计时).
+// handleConfirmationSubmitted 处理 confirmation 提交事件, 在已活跃的常驻通知上追加交互.
+//   - without: 立即放行, 不追加按钮(常驻通知保持纯进度展示).
+//   - auto:    追加双按钮 + 倒计时行.
+//   - manual:  追加双按钮(无倒计时).
+//
+// 常驻通知通常已由 BuildStarted 开启; 若未开启(BuildStarted 被跳过的边界场景)则此处兜底开启.
 func handleConfirmationSubmitted(cs *protobuf.Event_ConfirmationSubmitted, createdAt *timestamppb.Timestamp, state *notificationState, c *client.Client) {
 	switch cs.Mode {
 	case "without":
-		// 立即放行, 无需用户介入.
+		// 立即放行, 无需用户介入. 常驻通知保持当前 body(构建中).
 		return
 	case "auto", "manual":
-		// 进入常驻通知流程.
+		// 进入交互式 confirmation.
 	default:
 		logrus.Errorf("unexpected confirmer mode: %s", cs.Mode)
 		return
@@ -497,13 +542,14 @@ func handleConfirmationSubmitted(cs *protobuf.Event_ConfirmationSubmitted, creat
 	// 此处的 "deploy" 会让 build 确认发到 deploy confirmer (服务端按 uuid 查不到则静默忽略).
 	// 根治需要在 protobuf Event.ConfirmationSubmitted 增加 confirmer_type 字段.
 	scope := "deploy"
-	body := tr("phase_building")
+	body := tr("phase_waiting")
 	if cs.Mode == "manual" {
 		body = tr("waiting_confirm")
 	}
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	state.stopBackgroundTimersLocked() // confirmation 事件意味着新周期进行中, 取消上一周期的延迟关闭/残留 ticker
 	state.scope = scope
 	state.uuid = cs.Uuid
 	state.persistentMessage = body
