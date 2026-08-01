@@ -321,8 +321,8 @@ func runDesktop(cmd *cobra.Command, args []string) {
 }
 
 // makeOnAction 返回 ActionInvoked 信号回调.
-// deploy: 调用 gRPC Confirm(uuid, scope); cancel: 当前 protobuf 无 Cancel RPC, 记录并跳过.
-// (Cancel 路径需后续主进程 proto 扩展, 本任务约束"主进程零改动", 故仅保留 UI 入口.)
+// deploy: 调用 gRPC Confirm(uuid, scope); cancel: 调用 gRPC Cancel(uuid, scope).
+// (Cancel RPC 补全了 confirmation 生命周期: Confirm + Cancel 均走 gRPC.)
 //
 // 注: clientPtr 是共享指针, 解决"notify 回调在 client 建立前就注册"的时序问题——
 // 回调触发时读取 clientPtr 最新指向, 那时 client 必然已就绪(无 client 则无事件流, 也就无 confirmation).
@@ -340,20 +340,21 @@ func makeOnAction(state *notificationState, clientPtr *client.Client) func(*noti
 		if uuid == "" {
 			return
 		}
+		if *clientPtr == (client.Client{}) {
+			logrus.Warn("desktop: client not initialized, cannot handle action")
+			return
+		}
 		switch sig.ActionKey {
 		case "deploy":
 			logrus.Infof("desktop: user clicked deploy, confirming generation %s (%s)", uuid, scope)
-			if *clientPtr == (client.Client{}) {
-				logrus.Warn("desktop: client not initialized, cannot confirm")
-				return
-			}
 			if err := clientPtr.Confirm(uuid, scope); err != nil {
 				logrus.Errorf("desktop: confirm failed: %s", err)
 			}
 		case "cancel":
-			// TODO: protobuf 增加 Cancel RPC 后, 在此调用 client.Cancel().
-			// 当前主进程不支持 Cancel, 仅记录; UI 上仍提供入口便于未来接入.
-			logrus.Infof("desktop: user clicked skip, but Cancel RPC is not available in current comin protocol; generation %s will continue auto-confirm flow", uuid)
+			logrus.Infof("desktop: user clicked skip, cancelling confirmation %s (%s)", uuid, scope)
+			if err := clientPtr.Cancel(uuid, scope); err != nil {
+				logrus.Errorf("desktop: cancel failed: %s", err)
+			}
 		}
 	}
 }

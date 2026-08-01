@@ -101,3 +101,11 @@ func (c Client) Confirm(generationUUID, for_ string) error {
 		GenerationUuid: generationUUID, For: for_})
 	return err
 }
+
+// Cancel 取消处于 submitted 状态的 confirmation. for_ 语义同 Confirm: "build"/"deploy"/"all".
+// generationUUID 仅用于服务端日志, 不做匹配校验 (传空串亦可).
+func (c Client) Cancel(generationUUID, for_ string) error {
+	_, err := c.cominClient.Cancel(context.Background(), &protobuf.CancelRequest{
+		GenerationUuid: generationUUID, For: for_})
+	return err
+}
