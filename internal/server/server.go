@@ -102,6 +102,25 @@ func (s *cominServer) Confirm(ctx context.Context, req *protobuf.ConfirmRequest)
 	case "all":
 		s.manager.BuildConfirmer.Confirm(req.GenerationUuid)
 		s.manager.DeployConfirmer.Confirm(req.GenerationUuid)
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "invalid 'for' value: %q (want build/deploy/all)", req.For)
+	}
+	return nil, nil
+}
+
+// Cancel 取消处于 submitted 状态的 confirmation. 复用 Confirmer.Cancel() 现有能力, 不动核心逻辑.
+// req.GenerationUuid 仅用于日志, 服务端不做匹配校验 (若与当前 submitted 不符则 Cancel 是 no-op, 无害).
+func (s *cominServer) Cancel(ctx context.Context, req *protobuf.CancelRequest) (*emptypb.Empty, error) {
+	switch req.For {
+	case "build":
+		s.manager.BuildConfirmer.Cancel()
+	case "deploy":
+		s.manager.DeployConfirmer.Cancel()
+	case "all":
+		s.manager.BuildConfirmer.Cancel()
+		s.manager.DeployConfirmer.Cancel()
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "invalid 'for' value: %q (want build/deploy/all)", req.For)
 	}
 	return nil, nil
 }

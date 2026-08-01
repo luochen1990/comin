@@ -18,6 +18,7 @@ service Comin {
   rpc Suspend(google.protobuf.Empty) returns (google.protobuf.Empty) {}
   rpc Resume(google.protobuf.Empty) returns (google.protobuf.Empty) {}
   rpc Confirm(ConfirmRequest) returns (google.protobuf.Empty) {}
+  rpc Cancel(CancelRequest) returns (google.protobuf.Empty) {}
   rpc Events(google.protobuf.Empty) returns (stream Event);
   rpc DeploymentLatestSubmit(Operation) returns (google.protobuf.Empty) {}
 }
@@ -112,6 +113,13 @@ message Event {
 }
 
 message ConfirmRequest {
+  string generationUuid = 1;
+  string for = 2;  // possible values: "build", "deploy", "all"
+}
+
+// CancelRequest 与 ConfirmRequest 对称, 用于取消处于 submitted 状态的 confirmation
+// (服务端按 for 字段路由到对应 confirmer, generationUuid 仅用于日志, 不做匹配校验).
+message CancelRequest {
   string generationUuid = 1;
   string for = 2;  // possible values: "build", "deploy", "all"
 }
