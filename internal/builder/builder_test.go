@@ -25,8 +25,8 @@ type ExecutorMock struct {
 func (n ExecutorMock) ReadMachineId() (string, error) {
 	return "", nil
 }
-func (n ExecutorMock) NeedToReboot(_, _ string) bool {
-	return false
+func (n ExecutorMock) CheckReboot(_ string) *protobuf.RebootChecks {
+	return &protobuf.RebootChecks{}
 }
 func (n ExecutorMock) IsStorePathExist(storePath string) bool {
 	return n.alreadyBuilt

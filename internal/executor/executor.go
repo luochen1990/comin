@@ -37,7 +37,10 @@ type Executor interface {
 	Eval(ctx context.Context, source *protobuf.Source, stdout, stderr io.WriteCloser) (drvPath string, outPath string, machineId string, err error)
 	Build(ctx context.Context, drvPath string, stdout, stdin io.WriteCloser) (err error)
 	Deploy(ctx context.Context, outPath, operation string, profilePaths []string, stdout, stderr io.WriteCloser) (needToRestartComin bool, profilePath string, err error)
-	NeedToReboot(outPath, operation string) bool
+	// CheckReboot 比较 booted-system 与 outPath, 返回结构化的 reboot 检查事实.
+	// 纯事实陈述, 不做聚合; manager 层负责单调累积为 RebootStatus.
+	// outPath 通常是刚 build 出来的 system generation store path (BuildFinished 即可调用).
+	CheckReboot(outPath string) *protobuf.RebootChecks
 	ReadMachineId() (string, error)
 	// IsStorePathExist returns true if a storepath exists. This
 	// is used to detect if a build will be required or not.

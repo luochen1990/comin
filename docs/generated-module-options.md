@@ -488,6 +488,133 @@ pkgs.writers.writeBash "post" "echo $COMIN_GIT_SHA";
 
 
 
+## services\.comin\.rebootConfirmer
+
+
+
+The confirmer options for the reboot prompt after deployment\.
+
+
+
+*Type:*
+submodule
+
+
+
+*Default:*
+
+```nix
+{ }
+```
+
+
+
+## services\.comin\.rebootConfirmer\.autoconfirm_action
+
+
+
+The action to take when the reboot prompt autoconfirm timer expires\.
+Only effective when mode = “auto”\.
+“skip” (default, conservative): dismiss the notification, do not reboot\.
+“reboot”: automatically trigger systemctl reboot\.
+
+
+
+*Type:*
+one of “reboot”, “skip”
+
+
+
+*Default:*
+
+```nix
+"skip"
+```
+
+
+
+## services\.comin\.rebootConfirmer\.autoconfirm_duration
+
+
+
+The autoconfirm timer duration in seconds for the reboot prompt\.
+Only effective when mode = “auto”\. Default 300s (5 min) - longer than
+deploy’s 120s because reboot is more disruptive\.
+
+
+
+*Type:*
+signed integer
+
+
+
+*Default:*
+
+```nix
+300
+```
+
+
+
+## services\.comin\.rebootConfirmer\.mode
+
+
+
+The reboot notification mode\.
+“without”: no interactive prompt, only a transient notification (legacy behavior)\.
+“manual”: persistent interactive notification, waits indefinitely for user action\.
+“auto”: persistent interactive notification with countdown; on timeout performs autoconfirm_action\.
+
+
+
+*Type:*
+one of “without”, “auto”, “manual”
+
+
+
+*Default:*
+
+```nix
+"auto"
+```
+
+
+
+## services\.comin\.rebootConfirmer\.triggers
+
+
+
+Which RebootChecks fields trigger the interactive reboot notification\.
+Values are field names in kebab-case\. Available fields:
+
+ - kernel-changed, initrd-changed, kernel-modules-changed, systemd-abi-changed:
+   hard reboot requirements (content changed, reboot needed to take effect)\.
+ - systemd-upgraded:
+   soft reboot suggestion (new systemd version, PID 1 still runs old version)\.
+   Default excludes systemd-upgraded (only hard requirements trigger prompt)\.
+   Add “systemd-upgraded” to also be prompted on systemd version bumps\.
+   Empty list \[] disables the reboot notification entirely\.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+
+```nix
+[
+  "kernel-changed"
+  "initrd-changed"
+  "kernel-modules-changed"
+  "systemd-abi-changed"
+]
+```
+
+
+
 ## services\.comin\.remotes
 
 

@@ -34,8 +34,8 @@ func (n *GitNix) IsStorePathExist(storePath string) bool {
 	return isStorePathExist(storePath)
 }
 
-func (n *GitNix) NeedToReboot(outPath, operation string) bool {
-	return utils.NeedToRebootLinux(outPath, operation)
+func (n *GitNix) CheckReboot(outPath string) *protobuf.RebootChecks {
+	return utils.CheckRebootLinux(outPath)
 }
 
 func (n *GitNix) Eval(ctx context.Context, source *protobuf.Source, stdout, stderr io.WriteCloser) (drvPath string, outPath string, machineId string, err error) {

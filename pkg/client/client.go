@@ -109,3 +109,11 @@ func (c Client) Cancel(generationUUID, for_ string) error {
 		GenerationUuid: generationUUID, For: for_})
 	return err
 }
+
+// Reboot 请求主进程执行 systemctl reboot. 由 desktop 客户端的 reboot 交互通知 ("立即重启" 按钮) 调用.
+// 主进程以 root 运行, 有权限执行 reboot; 客户端 (systemd user service) 无 root 权限, 故走 RPC.
+// 不检查 rebootStatus: 信任客户端决策 (用户可能基于 pendingChecks 而非累积 rebootStatus 决定 reboot).
+func (c Client) Reboot() error {
+	_, err := c.cominClient.Reboot(context.Background(), &emptypb.Empty{})
+	return err
+}

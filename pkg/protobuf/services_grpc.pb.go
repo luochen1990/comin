@@ -29,6 +29,7 @@ const (
 	Comin_Resume_FullMethodName                 = "/protobuf.Comin/Resume"
 	Comin_Confirm_FullMethodName                = "/protobuf.Comin/Confirm"
 	Comin_Cancel_FullMethodName                 = "/protobuf.Comin/Cancel"
+	Comin_Reboot_FullMethodName                 = "/protobuf.Comin/Reboot"
 	Comin_Events_FullMethodName                 = "/protobuf.Comin/Events"
 	Comin_DeploymentLatestSubmit_FullMethodName = "/protobuf.Comin/DeploymentLatestSubmit"
 )
@@ -43,6 +44,7 @@ type CominClient interface {
 	Resume(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	Confirm(ctx context.Context, in *ConfirmRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	Cancel(ctx context.Context, in *CancelRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	Reboot(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	Events(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error)
 	DeploymentLatestSubmit(ctx context.Context, in *Operation, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
@@ -115,6 +117,16 @@ func (c *cominClient) Cancel(ctx context.Context, in *CancelRequest, opts ...grp
 	return out, nil
 }
 
+func (c *cominClient) Reboot(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, Comin_Reboot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *cominClient) Events(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &Comin_ServiceDesc.Streams[0], Comin_Events_FullMethodName, cOpts...)
@@ -154,6 +166,7 @@ type CominServer interface {
 	Resume(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
 	Confirm(context.Context, *ConfirmRequest) (*emptypb.Empty, error)
 	Cancel(context.Context, *CancelRequest) (*emptypb.Empty, error)
+	Reboot(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
 	Events(*emptypb.Empty, grpc.ServerStreamingServer[Event]) error
 	DeploymentLatestSubmit(context.Context, *Operation) (*emptypb.Empty, error)
 	mustEmbedUnimplementedCominServer()
@@ -183,6 +196,9 @@ func (UnimplementedCominServer) Confirm(context.Context, *ConfirmRequest) (*empt
 }
 func (UnimplementedCominServer) Cancel(context.Context, *CancelRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method Cancel not implemented")
+}
+func (UnimplementedCominServer) Reboot(context.Context, *emptypb.Empty) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method Reboot not implemented")
 }
 func (UnimplementedCominServer) Events(*emptypb.Empty, grpc.ServerStreamingServer[Event]) error {
 	return status.Error(codes.Unimplemented, "method Events not implemented")
@@ -319,6 +335,24 @@ func _Comin_Cancel_Handler(srv interface{}, ctx context.Context, dec func(interf
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Comin_Reboot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CominServer).Reboot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Comin_Reboot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CominServer).Reboot(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Comin_Events_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(emptypb.Empty)
 	if err := stream.RecvMsg(m); err != nil {
@@ -378,6 +412,10 @@ var Comin_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Cancel",
 			Handler:    _Comin_Cancel_Handler,
+		},
+		{
+			MethodName: "Reboot",
+			Handler:    _Comin_Reboot_Handler,
 		},
 		{
 			MethodName: "DeploymentLatestSubmit",

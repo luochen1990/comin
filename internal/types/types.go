@@ -64,6 +64,24 @@ type Confirmer struct {
 	AutoDuration int    `yaml:"autoconfirm_duration"`
 }
 
+// RebootConfirmer 控制 needs-reboot 交互通知的行为.
+// 与 build/deploy confirmer 不同: reboot 不阻塞主流程 (deploy 完成即视为成功),
+// 仅是给用户一个交互窗口决定是否立即重启.
+//
+// 注: 此类型当前由 comin-config.nix 序列化为 YAML, 但 Go 主进程并未消费 (reboot 配置
+// 通过 systemd 环境变量直接注入 desktop service). 保留此类型作为 YAML schema 的 Go 端
+// 镜像, 避免 config 解析在其他字段消费时因 unknown field 报错.
+type RebootConfirmer struct {
+	Mode                string `yaml:"mode"`
+	AutoconfirmDuration int    `yaml:"autoconfirm_duration"`
+	AutoconfirmAction   string `yaml:"autoconfirm_action"`
+	// Triggers 列出哪些 RebootChecks 字段为 true 时才弹交互式通知.
+	// 取值为字段名的 kebab-case: kernel-changed / initrd-changed / kernel-modules-changed /
+	// systemd-abi-changed / systemd-upgraded.
+	// 默认空列表 = 任意字段为 true 都触发 (即 Any()).
+	Triggers []string `yaml:"triggers"`
+}
+
 type Retention struct {
 	DeploymentBootEntryCapacity  int `yaml:"deployment_boot_entry_capacity"`
 	DeploymentSuccessfulCapacity int `yaml:"deployment_successful_capacity"`
@@ -75,20 +93,21 @@ type Configuration struct {
 	StateDir      string `yaml:"state_dir"`
 	StateFilepath string `yaml:"state_filepath"`
 	// RepositoryType describes type of the repository. It can currently only be "flake"
-	RepositoryType        string     `yaml:"repository_type"`
-	RepositorySubdir      string     `yaml:"repository_subdir"`
-	Submodules            bool       `yaml:"submodules"`
-	SystemAttr            string     `yaml:"system_attr"`
-	Remotes               []Remote   `yaml:"remotes"`
-	ApiServer             HttpServer `yaml:"api_server"`
-	Grpc                  Grpc       `yaml:"grpc"`
-	Exporter              HttpServer `yaml:"exporter"`
-	GpgPublicKeyPaths     []string   `yaml:"gpg_public_key_paths"`
-	SshAllowedSignersPath string     `yaml:"ssh_allowed_signers_path"`
-	PostDeploymentCommand string     `yaml:"post_deployment_command"`
-	BuildConfirmer        Confirmer  `yaml:"build_confirmer"`
-	DeployConfirmer       Confirmer  `yaml:"deploy_confirmer"`
-	Retention             Retention  `yaml:"retention"`
-	EvalTimeout           int        `yaml:"eval_timeout"`
-	BuildTimeout          int        `yaml:"build_timeout"`
+	RepositoryType        string          `yaml:"repository_type"`
+	RepositorySubdir      string          `yaml:"repository_subdir"`
+	Submodules            bool            `yaml:"submodules"`
+	SystemAttr            string          `yaml:"system_attr"`
+	Remotes               []Remote        `yaml:"remotes"`
+	ApiServer             HttpServer      `yaml:"api_server"`
+	Grpc                  Grpc            `yaml:"grpc"`
+	Exporter              HttpServer      `yaml:"exporter"`
+	GpgPublicKeyPaths     []string        `yaml:"gpg_public_key_paths"`
+	SshAllowedSignersPath string          `yaml:"ssh_allowed_signers_path"`
+	PostDeploymentCommand string          `yaml:"post_deployment_command"`
+	BuildConfirmer        Confirmer       `yaml:"build_confirmer"`
+	DeployConfirmer       Confirmer       `yaml:"deploy_confirmer"`
+	RebootConfirmer       RebootConfirmer `yaml:"reboot_confirmer"`
+	Retention             Retention       `yaml:"retention"`
+	EvalTimeout           int             `yaml:"eval_timeout"`
+	BuildTimeout          int             `yaml:"build_timeout"`
 }

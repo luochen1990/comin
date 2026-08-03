@@ -377,6 +377,73 @@ in
             };
           };
         };
+        # rebootConfirmer: needs-reboot 交互通知配置.
+        # 与 build/deploy confirmer 不同: reboot 不阻塞主流程 (deploy 完成 = 部署成功),
+        # 此 option 仅控制部署完成后若检测到 needs-reboot, 是否弹出交互通知及超时行为.
+        rebootConfirmer = mkOption {
+          description = "The confirmer options for the reboot prompt after deployment.";
+          default = { };
+          type = submodule {
+            options = {
+              mode = mkOption {
+                type = enum [
+                  "without"
+                  "auto"
+                  "manual"
+                ];
+                default = "auto";
+                description = ''
+                  The reboot notification mode.
+                  "without": no interactive prompt, only a transient notification (legacy behavior).
+                  "manual": persistent interactive notification, waits indefinitely for user action.
+                  "auto": persistent interactive notification with countdown; on timeout performs autoconfirm_action.
+                '';
+              };
+              autoconfirm_duration = mkOption {
+                type = int;
+                default = 300;
+                description = ''
+                  The autoconfirm timer duration in seconds for the reboot prompt.
+                  Only effective when mode = "auto". Default 300s (5 min) - longer than
+                  deploy's 120s because reboot is more disruptive.
+                '';
+              };
+              autoconfirm_action = mkOption {
+                type = enum [
+                  "reboot"
+                  "skip"
+                ];
+                default = "skip";
+                description = ''
+                  The action to take when the reboot prompt autoconfirm timer expires.
+                  Only effective when mode = "auto".
+                  "skip" (default, conservative): dismiss the notification, do not reboot.
+                  "reboot": automatically trigger systemctl reboot.
+                '';
+              };
+              triggers = mkOption {
+                type = listOf str;
+                default = [
+                  "kernel-changed"
+                  "initrd-changed"
+                  "kernel-modules-changed"
+                  "systemd-abi-changed"
+                ];
+                description = ''
+                  Which RebootChecks fields trigger the interactive reboot notification.
+                  Values are field names in kebab-case. Available fields:
+                  - kernel-changed, initrd-changed, kernel-modules-changed, systemd-abi-changed:
+                    hard reboot requirements (content changed, reboot needed to take effect).
+                  - systemd-upgraded:
+                    soft reboot suggestion (new systemd version, PID 1 still runs old version).
+                  Default excludes systemd-upgraded (only hard requirements trigger prompt).
+                  Add "systemd-upgraded" to also be prompted on systemd version bumps.
+                  Empty list [] disables the reboot notification entirely.
+                '';
+              };
+            };
+          };
+        };
         desktop = {
           enable = mkEnableOption "Whether to run the comin desktop service. This user service send notifications over DBus.";
           title = mkOption {

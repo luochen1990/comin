@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"time"
 
 	"github.com/nlewo/comin/internal/broker"
@@ -37,7 +38,20 @@ type Manager struct {
 	stateRequestCh chan struct{}
 	stateResultCh  chan *protobuf.State
 
-	needToReboot bool
+	// rebootStatus 是本次启动期间累积的 needs-reboot 状态 (单调累积, 仅 reboot 重置).
+	// 由多次 pendingChecks 在 DeploymentFinished 时 OR-accumulate 而成.
+	// 状态翻转 (从 IsEmpty → Any) 时发布 Event_RebootRequired.
+	// State.need_to_reboot 字段由 rebootStatus.Any() 派生, 不独立维护.
+	rebootStatus *protobuf.RebootChecks
+
+	// pendingChecks 是当前 build 出来的 generation (未 switch 或正在 switch) 的 reboot 检查事实.
+	// BuildFinished 时计算, 不累积; 每次 BuildFinished 都重新计算一个全新的.
+	// 用途: 让 deploy confirmation 阶段就能展示 "切换后需要重启: <reason>";
+	// 在 DeploymentFinished(done) 时累积到 rebootStatus, 然后清空.
+	pendingChecks *protobuf.RebootChecks
+
+	// rebootCh 接收来自 Reboot RPC 的请求, 由 Run 循环串行处理 (避免与状态更新并发).
+	rebootCh chan struct{}
 
 	prometheus      prometheus.Prometheus
 	storage         *store.Store
@@ -78,6 +92,9 @@ func New(s *store.Store,
 
 		stateRequestCh:          make(chan struct{}),
 		stateResultCh:           make(chan *protobuf.State),
+		rebootCh:                make(chan struct{}, 1),
+		rebootStatus:            &protobuf.RebootChecks{},
+		pendingChecks:           &protobuf.RebootChecks{},
 		prometheus:              p,
 		storage:                 s,
 		scheduler:               sched,
@@ -101,7 +118,7 @@ func (m *Manager) GetState() *protobuf.State {
 
 func (m *Manager) toState() *protobuf.State {
 	return &protobuf.State{
-		NeedToReboot:    wrapperspb.Bool(m.needToReboot),
+		NeedToReboot:    wrapperspb.Bool(m.rebootStatus.Any()),
 		IsSuspended:     wrapperspb.Bool(m.isSuspended),
 		Builder:         m.Builder.State(),
 		Deployer:        m.deployer.State(),
@@ -109,6 +126,18 @@ func (m *Manager) toState() *protobuf.State {
 		Store:           m.storage.GetState(),
 		BuildConfirmer:  m.BuildConfirmer.status(),
 		DeployConfirmer: m.DeployConfirmer.status(),
+	}
+}
+
+// RequestReboot 由 server.Reboot RPC 触发, 异步请求 manager 执行 reboot.
+// 非阻塞 (buffered chan), 重复调用自动合并 (manager 只需执行一次 reboot).
+func (m *Manager) RequestReboot() {
+	select {
+	case m.rebootCh <- struct{}{}:
+		logrus.Infof("manager: reboot requested")
+	default:
+		// 已有 pending reboot 请求, 忽略重复调用 (幂等).
+		logrus.Debugf("manager: reboot already pending, ignoring duplicate request")
 	}
 }
 
@@ -251,10 +280,25 @@ func (m *Manager) getOperationFromConfigurationOperations(remote, branch string)
 
 func (m *Manager) Run(ctx context.Context) {
 	logrus.Infof("manager: starting with machineId=%s", m.machineId)
+
+	// 启动时恢复 rebootStatus:
+	// 用上一次成功部署的 generation 的 outPath 与当前 booted-system 比较.
+	//   - 系统 reboot 后: booted-system 已更新为 lastDpl.OutPath (init 切了 generation),
+	//     CheckReboot 返回空 → rebootStatus 保持空 (正确: 系统 reboot 已清偿了所有 pending 变更).
+	//   - comin 进程崩溃重启 (非系统 reboot): booted-system 仍是旧的 → CheckReboot 返回差异
+	//     → 恢复累积状态 (正确: 之前未 reboot 的变更仍需告知用户).
 	lastDpl := m.deployer.State().Deployment
-	if lastDpl != nil {
-		m.needToReboot = m.executor.NeedToReboot(lastDpl.Generation.OutPath, lastDpl.Operation)
+	if lastDpl != nil && lastDpl.Generation != nil && lastDpl.Generation.OutPath != "" {
+		initial := m.executor.CheckReboot(lastDpl.Generation.OutPath)
+		if initial.Any() {
+			m.rebootStatus = initial
+			logrus.Infof("manager: restored reboot status on startup: %s", initial.Reason())
+		}
 	}
+
+	// 订阅 broker 事件流, 用于在 BuildFinished 时即时计算 pendingChecks
+	// (判断前移: 不等 switch, build 完成就知道这次是否需要 reboot).
+	subscriber := m.broker.Subscribe()
 
 	m.FetchAndBuild(ctx)
 	m.deployer.Run(ctx)
@@ -263,17 +307,53 @@ func (m *Manager) Run(ctx context.Context) {
 		select {
 		case <-m.stateRequestCh:
 			m.stateResultCh <- m.toState()
-		case dpl := <-m.deployer.DeploymentDoneCh:
-			m.needToReboot = m.executor.NeedToReboot(dpl.Generation.OutPath, dpl.Operation)
-			if m.needToReboot {
-				e := &protobuf.Event_RebootRequired{Deployment: dpl}
-				m.broker.Publish(&protobuf.Event{Type: &protobuf.Event_RebootRequired_{RebootRequired: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
+
+		case ev := <-subscriber:
+			// 处理 BuildFinished: 计算当前 generation 的 pendingChecks.
+			if bf, ok := ev.Type.(*protobuf.Event_BuildFinishedType); ok {
+				g := bf.BuildFinishedType.Generation
+				if g.BuildStatus == "built" && g.OutPath != "" {
+					m.pendingChecks = m.executor.CheckReboot(g.OutPath)
+					if m.pendingChecks.Any() {
+						logrus.Infof("manager: build finished, pending reboot checks: %s", m.pendingChecks.Reason())
+					}
+				}
 			}
+
+		case dpl := <-m.deployer.DeploymentDoneCh:
+			// 累积 pendingChecks 到 rebootStatus (单调 OR).
+			// 把"当前 generation 是否需要 reboot"的事实累积到"本次启动期间是否需要 reboot".
+			if dpl.Status == "done" && m.pendingChecks != nil && m.pendingChecks.Any() {
+				wasEmpty := m.rebootStatus.IsEmpty()
+				m.rebootStatus.Merge(m.pendingChecks)
+				// 状态翻转 (从无变更 → 有变更) 时发布 Event_RebootRequired.
+				// 语义改为 "状态翻转通知" 而非 "瞬时事实" (符合 rebootStatus 是持续状态的语义).
+				if wasEmpty && m.rebootStatus.Any() {
+					logrus.Infof("manager: reboot status flipped to true: %s", m.rebootStatus.Reason())
+					e := &protobuf.Event_RebootRequired{Deployment: dpl}
+					m.broker.Publish(&protobuf.Event{Type: &protobuf.Event_RebootRequired_{RebootRequired: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
+				}
+				// pendingChecks 清空, 等下一次 build.
+				// 不在 deploy 失败/cancelled 时累积: pendingChecks 反映的是"这次 build 是否需要 reboot",
+				// 即使部署失败, 内核/initrd 的内容差异仍然存在, 但没 switch 就不会让 rebootStatus 累积,
+				// 因为用户尚未"接受"这次变更.
+				m.pendingChecks = &protobuf.RebootChecks{}
+			}
+
 			if dpl.RestartComin.GetValue() {
 				// TODO: stop contexts
 				logrus.Infof("manager: comin needs to be restarted")
 				logrus.Infof("manager: exiting comin to let the service manager restart it")
 				os.Exit(0)
+			}
+
+		case <-m.rebootCh:
+			// 执行 reboot. 主进程以 root 运行, 直接调 systemctl.
+			// 不检查 rebootStatus: 既然用户/客户端显式请求了, 就执行 (信任客户端决策).
+			logrus.Infof("manager: executing systemctl reboot")
+			cmd := exec.Command("systemctl", "reboot")
+			if err := cmd.Run(); err != nil {
+				logrus.Errorf("manager: systemctl reboot failed: %s", err)
 			}
 		}
 	}

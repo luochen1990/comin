@@ -1,0 +1,10 @@
+# 运行时生成的状态文件 (comin local run / 测试)
+internal/store/state.json
+
+# Go
+*.test
+*.out
+
+# nix build 结果
+result
+result-*

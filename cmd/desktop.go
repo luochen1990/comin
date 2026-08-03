@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,11 +27,23 @@ import (
 	"github.com/godbus/dbus/v5"
 	"github.com/nlewo/comin/internal/builder"
 	"github.com/nlewo/comin/internal/store"
+	"github.com/nlewo/comin/internal/utils"
 	"github.com/nlewo/comin/pkg/client"
 	"github.com/nlewo/comin/pkg/protobuf"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+// --- 通知 action key 常量 ---
+//
+// 这些字符串是 FreeDesktop notification action 协议的 key, 跨进程 (desktop client ↔ 通知 daemon)
+// 传递, 改变需要两端同步. 抽为常量便于编译期拼写检查.
+const (
+	actionDeploy = "deploy" // deploy 通知的 "立即部署" 按钮
+	actionCancel = "cancel" // deploy 通知的 "跳过本次" 按钮
+	actionReboot = "reboot" // reboot 通知的 "立即重启" 按钮
+	actionSkip   = "skip"   // reboot 通知的 "暂不重启" 按钮
 )
 
 // --- i18n (轻量, 按 LANG 环境变量路由) ---
@@ -39,12 +52,13 @@ import (
 // 新增语言只需往这张表加条目, 翻译查找逻辑无需改动.
 var translations = map[string]map[string]string{
 	"zh_CN": {
-		"suspended":       "Agent 已挂起.",
-		"resumed":         "Agent 已恢复.",
-		"eval_failed":     "评估失败.",
-		"build_failed":    "构建失败.",
-		"reboot_required": "需要重启机器以使本次部署生效.",
-		"cancelled":       "部署已被取消.",
+		"suspended":        "Agent 已挂起.",
+		"resumed":          "Agent 已恢复.",
+		"eval_failed":      "评估失败.",
+		"build_failed":     "构建失败.",
+		"reboot_required":  "需要重启机器以使本次部署生效.",
+		"cancelled":        "部署已被取消.",
+		"reboot_cancelled": "已推迟重启.",
 		// 常驻通知阶段文案(同一通知 body 随阶段刷新)
 		"phase_building":  "正在构建来自 %s/%s 的新提交.",
 		"phase_waiting":   "构建完成, 等待确认.",
@@ -56,14 +70,23 @@ var translations = map[string]map[string]string{
 		"skip":            "跳过本次",
 		"countdown":       "剩余 %d 秒后自动放行",
 		"waiting_confirm": "等待你的确认",
+		// reboot 交互通知文案
+		"reboot_now":              "立即重启",
+		"reboot_skip":             "暂不重启",
+		"reboot_countdown_reboot": "剩余 %d 秒后自动重启",
+		"reboot_countdown_skip":   "剩余 %d 秒后自动推迟",
+		"reboot_pending_hint":     "⚠ 切换后需要重启: %s",
+		"reboot_prompt_title":     "部署完成, 需要重启才能生效",
+		"reboot_reason_prefix":    "需要重启的原因: ",
 	},
 	"en": {
-		"suspended":       "The agent is suspended.",
-		"resumed":         "The agent is resumed.",
-		"eval_failed":     "The evaluation has failed.",
-		"build_failed":    "The build has failed.",
-		"reboot_required": "The machine needs to be rebooted to take the deployment into account.",
-		"cancelled":       "The deployment has been cancelled.",
+		"suspended":        "The agent is suspended.",
+		"resumed":          "The agent is resumed.",
+		"eval_failed":      "The evaluation has failed.",
+		"build_failed":     "The build has failed.",
+		"reboot_required":  "The machine needs to be rebooted to take the deployment into account.",
+		"cancelled":        "The deployment has been cancelled.",
+		"reboot_cancelled": "Reboot postponed.",
 		// Persistent notification phase strings (body refreshes as phase advances)
 		"phase_building":  "A new commit from %s/%s is building.",
 		"phase_waiting":   "Build finished, awaiting confirmation.",
@@ -75,6 +98,14 @@ var translations = map[string]map[string]string{
 		"skip":            "Skip this time",
 		"countdown":       "Auto-confirming in %d seconds",
 		"waiting_confirm": "Waiting for your confirmation",
+		// reboot interactive notification strings
+		"reboot_now":              "Reboot now",
+		"reboot_skip":             "Skip for now",
+		"reboot_countdown_reboot": "Auto-rebooting in %d seconds",
+		"reboot_countdown_skip":   "Auto-skipping in %d seconds",
+		"reboot_pending_hint":     "⚠ Reboot required after switch: %s",
+		"reboot_prompt_title":     "Deployment finished, reboot required to take effect",
+		"reboot_reason_prefix":    "Reboot reasons: ",
 	},
 }
 
@@ -117,6 +148,84 @@ func tr(key string, args ...interface{}) string {
 	return fmt.Sprintf(tmpl, args...)
 }
 
+// --- reboot 配置 (从环境变量读取, systemd 注入) ---
+
+// rebootConfig 控制 needs-reboot 交互通知的行为.
+// 由 NixOS module 通过 systemd 环境变量注入 (静态配置, 不走 gRPC).
+type rebootConfig struct {
+	// mode: "without" (瞬时通知) | "auto" (倒计时) | "manual" (等用户)
+	mode string
+	// autoconfirmDuration: auto 模式的倒计时秒数
+	autoconfirmDuration int
+	// autoconfirmAction: auto 模式归零后的动作, "reboot" 或 "skip"
+	autoconfirmAction string
+	// triggers: 哪些 RebootChecks 字段触发交互通知 (kebab-case), 空切片表示 Any() 触发
+	triggers []string
+}
+
+// loadRebootConfig 从环境变量解析 rebootConfirmer 配置.
+// 缺失字段用合理默认值 (与 NixOS module 默认值一致):
+//
+//	mode=auto, duration=300, action=skip, triggers=4 项硬性要求.
+//
+// 特殊值: COMIN_REBOOT_TRIGGERS="none" 表示显式禁用 (shouldPromptReboot 永远返回 false).
+// COMIN_REBOOT_TRIGGERS="any" 或未设置 表示任意字段为 true 都触发 (默认 4 项硬性要求).
+func loadRebootConfig() rebootConfig {
+	cfg := rebootConfig{
+		mode:                envOr("COMIN_REBOOT_MODE", "auto"),
+		autoconfirmDuration: envIntOr("COMIN_REBOOT_AUTOCONFIRM_DURATION", 300),
+		autoconfirmAction:   envOr("COMIN_REBOOT_AUTOCONFIRM_ACTION", "skip"),
+	}
+	triggersStr := os.Getenv("COMIN_REBOOT_TRIGGERS")
+	switch triggersStr {
+	case "", "any":
+		// 未设置 或 显式 "any": 任意字段都触发 (triggers=nil 表示 Any() 触发).
+		cfg.triggers = nil
+	case "none":
+		// 显式禁用: triggers 为空切片, shouldPromptReboot 永远返回 false.
+		cfg.triggers = []string{}
+	default:
+		cfg.triggers = strings.Split(triggersStr, ",")
+	}
+	return cfg
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envIntOr(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+// shouldPromptReboot 根据 rebootConfig.triggers 判断 RebootChecks 是否应触发交互通知.
+// triggers 为 nil 表示 Any() 触发 (默认); 为空切片表示禁用; 否则只触发列出的字段.
+func shouldPromptReboot(checks *protobuf.RebootChecks, cfg rebootConfig) bool {
+	if checks == nil || checks.IsEmpty() {
+		return false
+	}
+	if cfg.triggers == nil {
+		return checks.Any()
+	}
+	return checks.AnyTriggered(cfg.triggers)
+}
+
+// rebootActions 返回 reboot 交互通知的双按钮 (经 i18n).
+func rebootActions() []notify.Action {
+	return []notify.Action{
+		{Key: actionReboot, Label: tr("reboot_now")},
+		{Key: actionSkip, Label: tr("reboot_skip")},
+	}
+}
+
 // --- 通知状态机 ---
 
 // notificationState 管理一次部署周期内的常驻通知生命周期.
@@ -143,6 +252,23 @@ type notificationState struct {
 	// persistentMessage 是"基础文案"(phase_building/phase_deploying 等),
 	// 刷新时 body = persistentMessage, auto 模式再追加倒计时行.
 	persistentMessage string
+
+	// --- reboot 交互通知相关字段 ---
+	// rebootCfg: 从环境变量读取的 rebootConfirmer 配置 (静态, 启动时一次性读取).
+	rebootCfg rebootConfig
+	// pendingChecks: 当前 generation 的 needs-reboot 检查结果 (BuildFinished 时计算).
+	// 用于在 deploy confirmation 阶段展示 "切换后需要重启" 提示.
+	pendingChecks *protobuf.RebootChecks
+	// rebootNotifier: 当前 reboot 交互通知的专用 notifier (与 deploy 通知独立, 避免互相 replaces_id).
+	// nil 表示没有活跃的 reboot 通知.
+	rebootID uint32
+	// rebootTicker / rebootDeadline / rebootStopCh: reboot 通知的倒计时机制 (与 deploy 倒计时独立).
+	rebootDeadline time.Time
+	rebootTicker   *time.Ticker
+	rebootStopCh   chan struct{}
+	// rebootClientPtr: 倒计时 goroutine 自动归零时调用 Reboot RPC 用.
+	// 不直接持有 client, 而是指针, 因为 client 在 main 启动后才有值.
+	rebootClientPtr *client.Client
 }
 
 const countdownInterval = 5 * time.Second
@@ -178,6 +304,8 @@ func (s *notificationState) close() {
 	defer s.mu.Unlock()
 	s.stopBackgroundTimersLocked()
 	s.closeLocked()
+	s.stopRebootTimersLocked()
+	s.closeRebootLocked()
 }
 
 // closeLocked 关闭当前常驻通知并重置状态字段. 必须持有 s.mu.
@@ -223,6 +351,122 @@ func (s *notificationState) stopDoneTimerLocked() {
 	}
 }
 
+// --- reboot 通知的 helper methods ---
+
+// showOrUpdateRebootLocked 发送/刷新 reboot 常驻通知. actions 为 nil 时不带按钮.
+// 调用者必须持有 s.mu.
+func (s *notificationState) showOrUpdateRebootLocked(body string, actions []notify.Action) {
+	if s.notifier == nil {
+		return
+	}
+	n := notify.Notification{
+		AppName:       "comin",
+		ReplacesID:    s.rebootID,
+		Summary:       s.summary,
+		Body:          body,
+		Actions:       actions,
+		ExpireTimeout: notify.ExpireTimeoutNever, // 永不超时
+	}
+	id, err := s.notifier.SendNotification(n)
+	if err != nil {
+		logrus.Errorf("desktop: send/refresh reboot notification failed: %s", err)
+		return
+	}
+	s.rebootID = id
+}
+
+// closeRebootLocked 关闭当前 reboot 通知并重置 ID. 必须持有 s.mu.
+func (s *notificationState) closeRebootLocked() {
+	if s.rebootID != 0 && s.notifier != nil {
+		if _, err := s.notifier.CloseNotification(s.rebootID); err != nil {
+			logrus.Debugf("desktop: close reboot notification %d failed: %s", s.rebootID, err)
+		}
+	}
+	s.rebootID = 0
+}
+
+// stopRebootTimersLocked 停止 reboot 倒计时 goroutine, 必须持有 s.mu.
+func (s *notificationState) stopRebootTimersLocked() {
+	if s.rebootTicker != nil {
+		s.rebootTicker.Stop()
+		select {
+		case <-s.rebootStopCh:
+		default:
+			close(s.rebootStopCh)
+		}
+		s.rebootTicker = nil
+		s.rebootStopCh = nil
+	}
+}
+
+// startRebootCountdownLocked 启动 reboot auto 模式倒计时. 必须持有 s.mu.
+// cfg.autoconfirmAction 决定归零后的动作 ("reboot" / "skip") 及倒计时文案.
+func (s *notificationState) startRebootCountdownLocked(cfg rebootConfig) {
+	s.stopRebootTimersLocked()
+	s.rebootTicker = time.NewTicker(countdownInterval)
+	s.rebootStopCh = make(chan struct{})
+	ticker := s.rebootTicker
+	stopCh := s.rebootStopCh
+	deadline := s.rebootDeadline
+	action := cfg.autoconfirmAction
+	clientPtr := s.rebootClientPtr
+	state := s
+	go func() {
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				state.mu.Lock()
+				if state.rebootID == 0 {
+					state.mu.Unlock()
+					return
+				}
+				remaining := int(time.Until(deadline).Seconds())
+				if remaining <= 0 {
+					// 归零: 执行 autoconfirm_action.
+					body := state.rebootCountdownBody(0, action)
+					state.showOrUpdateRebootLocked(body, rebootActions())
+					state.stopRebootTimersLocked()
+					// skip 动作需显式关闭通知 (reboot 动作由 systemctl 实际重启时 daemon 自动关闭).
+					if action == "skip" {
+						state.closeRebootLocked()
+					}
+					state.mu.Unlock()
+					// reboot 动作: 在 goroutine 中调 RPC (不在持锁状态, 避免死锁).
+					// clientPtr 永远非 nil (主流程初始化时赋值), 但可能指向零值 Client{} (stream 未建立);
+					// 与 makeOnAction 一致用值比较判断 client 是否就绪.
+					if action == "reboot" && *clientPtr != (client.Client{}) {
+						logrus.Infof("desktop: reboot autoconfirm expired, triggering reboot")
+						if err := clientPtr.Reboot(); err != nil {
+							logrus.Errorf("desktop: auto-reboot RPC failed: %s", err)
+						}
+					}
+					return
+				}
+				body := state.rebootCountdownBody(remaining, action)
+				state.showOrUpdateRebootLocked(body, rebootActions())
+				state.mu.Unlock()
+			}
+		}
+	}()
+}
+
+// rebootCountdownBody 构造 reboot 倒计时通知的 body 文案. 必须持有 s.mu (因读 persistentMessage).
+func (s *notificationState) rebootCountdownBody(remaining int, action string) string {
+	body := tr("reboot_prompt_title")
+	if s.persistentMessage != "" {
+		body = s.persistentMessage
+	}
+	var countdownKey string
+	if action == "reboot" {
+		countdownKey = "reboot_countdown_reboot"
+	} else {
+		countdownKey = "reboot_countdown_skip"
+	}
+	return body + "\n" + tr(countdownKey, remaining)
+}
+
 // startCountdownLocked 启动 auto 模式倒计时刷新 goroutine. 必须持有 s.mu.
 func (s *notificationState) startCountdownLocked() {
 	s.stopTickerLocked()
@@ -260,11 +504,11 @@ func (s *notificationState) startCountdownLocked() {
 }
 
 // persistentActions 返回常驻通知的双按钮 action 列表(经 i18n).
-// 两个 action key 与 FreeDesktop 规范一致: "deploy" / "cancel".
+// 两个 action key 与 FreeDesktop 规范一致: actionDeploy / actionCancel.
 func persistentActions() []notify.Action {
 	return []notify.Action{
-		{Key: "deploy", Label: tr("deploy_now")},
-		{Key: "cancel", Label: tr("skip")},
+		{Key: actionDeploy, Label: tr("deploy_now")},
+		{Key: actionCancel, Label: tr("skip")},
 	}
 }
 
@@ -292,7 +536,14 @@ func runDesktop(cmd *cobra.Command, args []string) {
 		logrus.Fatalf("desktop: cannot connect to session bus: %s", err)
 	}
 
-	state := &notificationState{summary: title}
+	state := &notificationState{
+		summary:       title,
+		rebootCfg:     loadRebootConfig(),
+		pendingChecks: &protobuf.RebootChecks{},
+	}
+	logrus.Infof("desktop: reboot config loaded: mode=%s duration=%d action=%s triggers=%v",
+		state.rebootCfg.mode, state.rebootCfg.autoconfirmDuration,
+		state.rebootCfg.autoconfirmAction, state.rebootCfg.triggers)
 	// 注: notify.WithOnAction 注册的是静态回调, action 触发时 client 可能尚未/已经建立.
 	// 用一个共享指针承载当前可用的 client, 回调闭包读取其最新值.
 	clientPtr := &client.Client{}
@@ -300,26 +551,31 @@ func runDesktop(cmd *cobra.Command, args []string) {
 		conn,
 		notify.WithOnAction(makeOnAction(state, clientPtr)),
 		notify.WithOnClosed(func(sig *notify.NotificationClosedSignal) {
-			// 用户手动关闭通知时, 同步清理内部状态(避免 currentID 指向已失效通知).
+			// 用户手动关闭通知时, 同步清理内部状态(避免 currentID/rebootID 指向已失效通知).
 			state.mu.Lock()
-			if sig.ID == state.currentID {
+			switch sig.ID {
+			case state.currentID:
 				// 复用 closeLocked: CloseNotification 对已关闭 id 是 no-op(仅刷 Debug 日志).
 				state.stopBackgroundTimersLocked()
 				state.closeLocked()
+			case state.rebootID:
+				state.stopRebootTimersLocked()
+				state.closeRebootLocked()
 			}
 			state.mu.Unlock()
 		}),
 	)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		logrus.Fatalf("desktop: cannot create notifier: %s", err)
 	}
 	state.notifier = notifier
 	state.conn = conn
+	state.rebootClientPtr = clientPtr
 	defer func() {
 		state.close()
-		notifier.Close()
-		conn.Close()
+		_ = notifier.Close()
+		_ = conn.Close()
 	}()
 
 	test, _ := cmd.Flags().GetBool("test")
@@ -351,6 +607,7 @@ func runDesktop(cmd *cobra.Command, args []string) {
 
 // makeOnAction 返回 ActionInvoked 信号回调.
 // deploy: 调用 gRPC Confirm(uuid, scope); cancel: 调用 gRPC Cancel(uuid, scope).
+// reboot: 调用 gRPC Reboot(); skip: 关闭 reboot 通知 (复用同一回调, 通过 action key 区分).
 // (Cancel RPC 补全了 confirmation 生命周期: Confirm + Cancel 均走 gRPC.)
 //
 // 注: clientPtr 是共享指针, 解决"notify 回调在 client 建立前就注册"的时序问题——
@@ -358,32 +615,65 @@ func runDesktop(cmd *cobra.Command, args []string) {
 func makeOnAction(state *notificationState, clientPtr *client.Client) func(*notify.ActionInvokedSignal) {
 	return func(sig *notify.ActionInvokedSignal) {
 		state.mu.Lock()
-		// 只响应当前常驻通知的 action, 忽略其他来源( notifier 会收到总线上所有通知的信号).
-		if sig.ID != state.currentID {
+		// 首先尝试匹配 deploy 常驻通知 (currentID).
+		// 再尝试 reboot 常驻通知 (rebootID). 两者互斥 (同一时刻只有一个活跃).
+		isDeployNotif := sig.ID == state.currentID && state.currentID != 0
+		isRebootNotif := sig.ID == state.rebootID && state.rebootID != 0
+		if !isDeployNotif && !isRebootNotif {
 			state.mu.Unlock()
 			return
 		}
 		uuid := state.uuid
 		scope := state.scope
 		state.mu.Unlock()
-		if uuid == "" {
-			return
-		}
-		if *clientPtr == (client.Client{}) {
-			logrus.Warn("desktop: client not initialized, cannot handle action")
-			return
-		}
+
 		switch sig.ActionKey {
-		case "deploy":
+		case actionDeploy:
+			if uuid == "" {
+				return
+			}
+			if *clientPtr == (client.Client{}) {
+				logrus.Warn("desktop: client not initialized, cannot handle deploy action")
+				return
+			}
 			logrus.Infof("desktop: user clicked deploy, confirming generation %s (%s)", uuid, scope)
 			if err := clientPtr.Confirm(uuid, scope); err != nil {
 				logrus.Errorf("desktop: confirm failed: %s", err)
 			}
-		case "cancel":
+		case actionCancel:
+			if uuid == "" {
+				return
+			}
+			if *clientPtr == (client.Client{}) {
+				logrus.Warn("desktop: client not initialized, cannot handle cancel action")
+				return
+			}
 			logrus.Infof("desktop: user clicked skip, cancelling confirmation %s (%s)", uuid, scope)
 			if err := clientPtr.Cancel(uuid, scope); err != nil {
 				logrus.Errorf("desktop: cancel failed: %s", err)
 			}
+		case actionReboot:
+			if *clientPtr == (client.Client{}) {
+				logrus.Warn("desktop: client not initialized, cannot handle reboot action")
+				return
+			}
+			logrus.Infof("desktop: user clicked reboot now, triggering reboot RPC")
+			if err := clientPtr.Reboot(); err != nil {
+				logrus.Errorf("desktop: reboot RPC failed: %s", err)
+			}
+			// 通知会在系统实际重启时被 daemon 自动关闭, 这里先停倒计时即可.
+			state.mu.Lock()
+			state.stopRebootTimersLocked()
+			state.mu.Unlock()
+		case actionSkip:
+			// 仅 reboot 通知用 actionSkip key. 关闭通知, 停倒计时.
+			logrus.Infof("desktop: user clicked skip reboot")
+			state.mu.Lock()
+			state.stopRebootTimersLocked()
+			state.closeRebootLocked()
+			state.mu.Unlock()
+			// 发一个瞬时通知告知用户已推迟.
+			sendTransient(state, tr("reboot_cancelled"))
 		}
 	}
 }
@@ -438,7 +728,19 @@ func handler(event *protobuf.Event, state *notificationState, c *client.Client) 
 			state.close()
 			sendTransient(state, tr("build_failed"))
 		case "built":
-			// 构建完成, 等待 confirmation/deploy 事件.
+			// 构建完成: 在本地复算 pendingChecks (复用同一份算法, 避免 proto 改动).
+			// 用于在 deploy confirmation 阶段提示用户"切换后需要重启".
+			// 注意: outPath 是 nix store 路径, 全局可读, 无权限问题.
+			if g.OutPath != "" {
+				state.mu.Lock()
+				state.pendingChecks = utils.CheckRebootLinux(g.OutPath)
+				pc := state.pendingChecks
+				state.mu.Unlock()
+				if pc.Any() {
+					logrus.Infof("desktop: build finished, pending reboot checks: %s", pc.Reason())
+				}
+			}
+			// 等待 confirmation/deploy 事件.
 			// DeployConfirmer=without: 主进程立即放行, 紧接着 DeploymentStarted 会刷新 body.
 			// DeployConfirmer=auto/manual: ConfirmationSubmitted 会追加按钮/倒计时.
 		default:
@@ -486,7 +788,9 @@ func handler(event *protobuf.Event, state *notificationState, c *client.Client) 
 			state.doneTimer = nil
 		})
 	case *protobuf.Event_RebootRequired_:
-		sendTransient(state, tr("reboot_required"))
+		// needs-reboot 状态翻转通知 (manager 从 IsEmpty → Any 时发布).
+		// 按 rebootConfirmer.mode 弹出交互式通知或瞬时通知.
+		handleRebootRequired(state, c)
 	// 高频/内部事件: 静默(空 case 避免 default 分支错误日志刷屏)
 	case *protobuf.Event_ManagerState_:
 	case *protobuf.Event_Fetched_:
@@ -548,6 +852,12 @@ func handleConfirmationSubmitted(cs *protobuf.Event_ConfirmationSubmitted, creat
 		body = tr("waiting_confirm")
 	}
 
+	// 若 pendingChecks 表明切换后需要 reboot, 追加提示行 (帮助用户在 confirmation 阶段做决策).
+	// 仅展示 triggers 配置关心的字段 (避免 systemd-upgraded 等软信号刷屏).
+	if shouldPromptReboot(state.pendingChecks, state.rebootCfg) {
+		body = body + "\n" + tr("reboot_pending_hint", state.pendingChecks.Reason())
+	}
+
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.stopBackgroundTimersLocked() // confirmation 事件意味着新周期进行中, 取消上一周期的延迟关闭/残留 ticker
@@ -580,6 +890,69 @@ func autoconfirmDuration(c *client.Client) time.Duration {
 		return 0
 	}
 	return time.Duration(st.DeployConfirmer.GetAutoconfirmDuration()) * time.Second
+}
+
+// handleRebootRequired 处理 needs-reboot 状态翻转事件, 按 rebootConfirmer.mode 弹通知.
+//   - without: 瞬时通知 (legacy 行为, 不交互).
+//   - manual:  常驻交互通知, 无倒计时, 等用户.
+//   - auto:    常驻交互通知 + 倒计时, 归零按 autoconfirm_action 执行 (默认 skip).
+//
+// 通知 body 展示 pendingChecks.Reason() (用户配置的 triggers 字段中为 true 的项).
+// "立即重启"按钮调 gRPC Reboot; "暂不重启"按钮关闭通知.
+//
+// 与 deploy 通知的关系: 两者互斥 (各自独立 ID), 不互相 replaces_id.
+// RebootRequired 事件通常在 DeploymentFinished 之后到达 (manager 在 deploy done 时累积翻转),
+// 故 deploy 通知的 doneTimer 可能正在等待关闭; 这里中断它, 转入 reboot 通知生命周期.
+func handleRebootRequired(state *notificationState, c *client.Client) {
+	cfg := state.rebootCfg
+	if cfg.mode == "without" {
+		// legacy 行为: 仅瞬时通知, 不交互.
+		sendTransient(state, tr("reboot_required"))
+		return
+	}
+
+	// pendingChecks 应该已经被 BuildFinished 算好. 但 RebootRequired 可能在 switch 完成
+	// (DeploymentFinished) 之后到达, 此时 pendingChecks 仍是本次 generation 的检查结果
+	// (manager 在 DeployDone 后才清空 pendingChecks, 而 RebootRequired 在此之前发布).
+	// 复用本地 state.pendingChecks 展示即可.
+	checks := state.pendingChecks
+	if !shouldPromptReboot(checks, cfg) {
+		// 状态翻转了但 triggers 未命中 (如仅 systemd-upgraded 变化, 用户未启用该 trigger),
+		// 不弹交互通知, 仅瞬时提示.
+		logrus.Debugf("desktop: reboot required but no trigger matched, sending transient only")
+		sendTransient(state, tr("reboot_required"))
+		return
+	}
+
+	// 构造通知 body: 显示 reboot 原因.
+	body := tr("reboot_prompt_title")
+	if checks != nil && !checks.IsEmpty() {
+		body = body + "\n" + tr("reboot_reason_prefix") + checks.Reason()
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	// 关闭 deploy 通知 (避免 deploy 通知和 reboot 通知同时并存, 造成 UX 混乱).
+	// reboot 通知接管常驻通知槽位, 持续展示直到用户决策或倒计时归零.
+	state.stopBackgroundTimersLocked()
+	state.closeLocked()
+	// 重置 reboot 状态.
+	state.stopRebootTimersLocked()
+	state.persistentMessage = body
+	state.showOrUpdateRebootLocked(body, rebootActions())
+
+	if cfg.mode == "auto" {
+		// 启动倒计时.
+		state.rebootDeadline = time.Now().Add(time.Duration(cfg.autoconfirmDuration) * time.Second)
+		remaining := int(time.Until(state.rebootDeadline).Seconds())
+		if remaining < 0 {
+			remaining = 0
+		}
+		body = state.rebootCountdownBody(remaining, cfg.autoconfirmAction)
+		state.showOrUpdateRebootLocked(body, rebootActions())
+		state.startRebootCountdownLocked(cfg)
+	}
+	// manual 模式: 无倒计时, 通知保留直到用户点击或手动关闭.
 }
 
 // sendTransient 发送一条瞬时通知(without 模式 / 常驻关闭后的结果提示).
@@ -616,6 +989,14 @@ func scenario(conn *dbus.Conn, state *notificationState) {
 	handler(&e, state, nil)
 	time.Sleep(time.Second)
 
+	// 模拟 BuildFinished + 本地复算 pendingChecks (模拟 kernel 变更场景)
+	state.mu.Lock()
+	state.pendingChecks = &protobuf.RebootChecks{
+		KernelChanged: true,
+		InitrdChanged: true,
+	}
+	state.mu.Unlock()
+
 	// 模拟 confirmation(auto 模式, 倒计时 30s)
 	cs := protobuf.Event_ConfirmationSubmitted{Mode: "auto", Uuid: "test-uuid"}
 	e = protobuf.Event{
@@ -640,9 +1021,12 @@ func scenario(conn *dbus.Conn, state *notificationState) {
 	e = protobuf.Event{Type: &protobuf.Event_DeploymentFinishedType{DeploymentFinishedType: &protobuf.Event_DeploymentFinished{Deployment: &d}}}
 	handler(&e, state, nil)
 
-	time.Sleep(time.Second)
+	// 模拟 RebootRequired: 触发 reboot 交互通知 (倒计时 + 双按钮)
+	time.Sleep(2 * time.Second)
 	e = protobuf.Event{Type: &protobuf.Event_RebootRequired_{RebootRequired: &protobuf.Event_RebootRequired{Deployment: &d}}}
 	handler(&e, state, nil)
+	// 让 reboot 通知倒计时展示一会儿
+	time.Sleep(20 * time.Second)
 }
 
 func init() {

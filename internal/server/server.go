@@ -125,6 +125,14 @@ func (s *cominServer) Cancel(ctx context.Context, req *protobuf.CancelRequest) (
 	return nil, nil
 }
 
+// Reboot 触发系统 reboot. 由 desktop 客户端的 reboot 交互通知 ("立即重启" 按钮) 调用.
+// manager 以 root 运行, 直接执行 systemctl reboot.
+// 不检查 rebootStatus: 信任客户端决策 (用户可能基于 pendingChecks 而非累积 rebootStatus 决定 reboot).
+func (s *cominServer) Reboot(ctx context.Context, empty *emptypb.Empty) (*emptypb.Empty, error) {
+	s.manager.RequestReboot()
+	return nil, nil
+}
+
 func (c *cominServer) Start() {
 	go func() {
 		if _, err := os.Stat(c.unixSocketPath); err == nil {

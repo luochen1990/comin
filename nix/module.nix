@@ -49,6 +49,21 @@ in
       serviceConfig = {
         ExecStart = ''${lib.getExe package} desktop --title "${cfg.services.comin.desktop.title}"'';
       };
+      # 通过环境变量传递 rebootConfirmer 配置到 desktop 服务.
+      # 设计理由: 这些是静态配置 (mode/duration/action/triggers), 不属于运行时状态,
+      # 不需要走 gRPC 同步; 直接由 systemd 注入, desktop 启动时一次性读取即可.
+      environment =
+        let
+          rc = cfg.services.comin.rebootConfirmer;
+        in
+        {
+          COMIN_REBOOT_MODE = rc.mode;
+          COMIN_REBOOT_AUTOCONFIRM_DURATION = toString rc.autoconfirm_duration;
+          COMIN_REBOOT_AUTOCONFIRM_ACTION = rc.autoconfirm_action;
+          # triggers 空列表是合法配置 (用户显式禁用 reboot 通知), 必须与"未设置"(走默认值)区分.
+          # 用特殊哨兵 "none" 标记空列表, desktop 侧据此真正禁用 (而非回退到默认值).
+          COMIN_REBOOT_TRIGGERS = if rc.triggers == [ ] then "none" else lib.concatStringsSep "," rc.triggers;
+        };
     };
 
     environment.systemPackages = [ package ];

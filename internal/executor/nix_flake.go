@@ -33,16 +33,16 @@ func (n *GitNixFlake) ReadMachineId() (string, error) {
 	return utils.ReadMachineIdLinux()
 }
 
-func (n *GitNixFlake) NeedToReboot(outPath, operation string) bool {
+func (n *GitNixFlake) CheckReboot(outPath string) *protobuf.RebootChecks {
 	if n.systemAttr == "darwinConfigurations" {
 		// TODO: Implement proper reboot detection for Darwin
 		// Unlike NixOS which has /run/current-system vs /run/booted-system paths,
 		// Darwin/macOS doesn't have equivalent mechanisms for detecting when
 		// a reboot is needed after nix-darwin configuration changes.
-		// For now, conservatively assume no reboot is needed.
-		return false
+		// For now, conservatively report no changes.
+		return &protobuf.RebootChecks{}
 	}
-	return utils.NeedToRebootLinux(outPath, operation)
+	return utils.CheckRebootLinux(outPath)
 }
 
 func (n *GitNixFlake) IsStorePathExist(storePath string) bool {

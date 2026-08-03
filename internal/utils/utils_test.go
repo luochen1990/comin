@@ -3,6 +3,7 @@ package utils
 import (
 	"testing"
 
+	"github.com/nlewo/comin/pkg/protobuf"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -55,31 +56,21 @@ func TestReadMachineId(t *testing.T) {
 	}
 }
 
-func TestNeedToReboot(t *testing.T) {
-	tests := []struct {
-		name             string
-		systemAttr       string
-		expectedBehavior string
+func TestCheckReboot(t *testing.T) {
+	// 非 NixOS 环境 (CI): /run/booted-system 不存在, 所有字段应为 false (无 panic).
+	// 边界覆盖: 空路径 / 不存在的 outPath 都不应 panic.
+	cases := []struct {
+		name    string
+		outPath string
 	}{
-		{
-			name:             "Linux reboot check",
-			systemAttr:       "nixosConfigurations",
-			expectedBehavior: "should call needToRebootLinux",
-		},
-		{
-			name:             "Darwin reboot check",
-			systemAttr:       "darwinConfigurations",
-			expectedBehavior: "should call needToRebootDarwin",
-		},
+		{"empty outPath", ""},
+		{"/run/booted-system missing", "/nix/store/nonexistent"},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Test that the function doesn't panic and follows the right code path
-			result := NeedToRebootLinux("", "")
-			t.Logf("NeedToReboot with %s returned: %v", tt.systemAttr, result)
-			// The function should return a boolean without panicking
-			assert.IsType(t, false, result)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := CheckRebootLinux(tc.outPath)
+			assert.IsType(t, &protobuf.RebootChecks{}, result)
+			t.Logf("CheckReboot(%q): %+v", tc.outPath, result)
 		})
 	}
 }
