@@ -3,14 +3,20 @@
 // 原地刷新(replaces_id); confirmation 阶段在 auto/manual 模式下追加双按钮 + 倒计时.
 // 部署外的独立事件(suspend/resume/reboot)走瞬时通知.
 //
+// body 结构 (自顶而下):
+//
+//	<commit subject> (<short id>)   ← commit header, 由 BuildStarted 提取, 全周期常驻
+//	<阶段文案>                       ← persistentMessage (building/waiting/deploying/done/failed)
+//	剩余 N 秒后自动放行              ← 倒计时行 (仅 auto 模式 confirmation 阶段)
+//
 // 生命周期(场景 A: BuildConfirmer=without, DeployConfirmer=auto):
 //
-//	BuildStarted        → 开常驻, body="正在构建 origin/main", 无按钮
+//	BuildStarted        → 开常驻, body="<commit header>\n正在构建 origin/main", 无按钮
 //	BuildFinished(built)→ 静默(等 confirm)
 //	ConfirmationSubmitted(auto) → 刷新常驻, 追加按钮 + 倒计时行
 //	ConfirmationConfirmed       → 停 ticker, 通知保留
-//	DeploymentStarted  → 刷新常驻, body="正在部署", 去按钮
-//	DeploymentFinished → 刷新常驻, body="部署完成", 去按钮; 由 doneTimer 延迟关闭
+//	DeploymentStarted  → 刷新常驻, body="<commit header>\n正在部署", 去按钮
+//	DeploymentFinished → 刷新常驻, body="<commit header>\n部署完成", 去按钮; 由 doneTimer 延迟关闭
 //	下一周期 BuildStarted → replaces_id 复用同一条通知(或上一条已被 doneTimer 关闭则新开)
 package cmd
 
@@ -249,9 +255,20 @@ type notificationState struct {
 	stopCh   chan struct{} // 通知 ticker goroutine 退出
 	// doneTimer: 部署完成后延迟关闭常驻通知(让用户看到"部署完成"结果再消失).
 	doneTimer *time.Timer
-	// persistentMessage 是"基础文案"(phase_building/phase_deploying 等),
-	// 刷新时 body = persistentMessage, auto 模式再追加倒计时行.
+	// persistentMessage 是"阶段文案"(phase_building/phase_deploying 等),
+	// 刷新时 body = commitHeader + persistentMessage, auto 模式再追加倒计时行.
 	persistentMessage string
+
+	// --- commit 信息 (当前部署周期对应的提交) ---
+	// 由 BuildStarted 事件从 Generation.SelectedCommitMsg / SelectedCommitId 提取,
+	// 在 showOrUpdateLocked/showOrUpdateRebootLocked 底层统一拼接到 body 顶部,
+	// 让所有阶段的通知都能展示"这次部署的是什么", 避免频繁交织部署时无法区分.
+	//
+	// 生命周期: 仅在 BuildStarted 写入, 不在 closeLocked 中清除 —
+	// commit 信息需跨 deploy 通知关闭存活, 供紧随其后的 reboot 通知延续展示
+	// (同一部署周期: deploy done → reboot required). 新周期 BuildStarted 会覆盖.
+	commitSubject string // commit message 首行 (subject)
+	commitShortID string // commit id 前 8 位 (对齐 git shortlog 粒度)
 
 	// --- reboot 交互通知相关字段 ---
 	// rebootCfg: 从环境变量读取的 rebootConfirmer 配置 (静态, 启动时一次性读取).
@@ -276,7 +293,45 @@ const countdownInterval = 5 * time.Second
 // doneDisplayDuration: 部署完成后常驻通知保留展示的时间, 超过后自动关闭.
 const doneDisplayDuration = 8 * time.Second
 
+// shortIDLen: commit short id 截取长度 (对齐 git shortlog 默认粒度).
+const shortIDLen = 8
+
+// commitSubjectFromMsg 从完整 commit message 中提取 subject (首行).
+// 空消息返回空串.
+func commitSubjectFromMsg(msg string) string {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return ""
+	}
+	if idx := strings.IndexByte(msg, '\n'); idx > 0 {
+		return msg[:idx]
+	}
+	return msg
+}
+
+// shortID 从完整 commit id 中截取前 shortIDLen 位.
+func shortID(id string) string {
+	if len(id) > shortIDLen {
+		return id[:shortIDLen]
+	}
+	return id
+}
+
+// withCommitHeader 在 body 顶部拼接 commit header (subject + short id).
+// 无 subject 时原样返回 body (避免引入空行). 调用者必须持有 s.mu.
+func (s *notificationState) withCommitHeader(body string) string {
+	if s.commitSubject == "" {
+		return body
+	}
+	header := s.commitSubject
+	if s.commitShortID != "" {
+		header = fmt.Sprintf("%s (%s)", header, s.commitShortID)
+	}
+	return header + "\n" + body
+}
+
 // showOrUpdate 发送/刷新常驻通知. actions 为 nil 时不带按钮(纯进度展示).
+// body 顶部自动拼接当前周期的 commit header (subject + short id).
 // 调用者必须持有 s.mu.
 func (s *notificationState) showOrUpdateLocked(body string, actions []notify.Action) {
 	if s.notifier == nil {
@@ -286,7 +341,7 @@ func (s *notificationState) showOrUpdateLocked(body string, actions []notify.Act
 		AppName:       "comin",
 		ReplacesID:    s.currentID,
 		Summary:       s.summary,
-		Body:          body,
+		Body:          s.withCommitHeader(body),
 		Actions:       actions,
 		ExpireTimeout: notify.ExpireTimeoutNever, // 永不超时
 	}
@@ -320,6 +375,8 @@ func (s *notificationState) closeLocked() {
 	s.uuid = ""
 	s.scope = ""
 	s.persistentMessage = ""
+	// 注: 不清除 commitSubject/commitShortID — commit 信息需跨 deploy 通知关闭存活,
+	// 供紧随其后的 reboot 通知延续展示 (字段生命周期见 notificationState 注释).
 }
 
 // stopBackgroundTimersLocked 停止所有后台定时器(倒计时 + 延迟关闭).
@@ -354,6 +411,7 @@ func (s *notificationState) stopDoneTimerLocked() {
 // --- reboot 通知的 helper methods ---
 
 // showOrUpdateRebootLocked 发送/刷新 reboot 常驻通知. actions 为 nil 时不带按钮.
+// body 顶部自动拼接当前周期的 commit header (subject + short id).
 // 调用者必须持有 s.mu.
 func (s *notificationState) showOrUpdateRebootLocked(body string, actions []notify.Action) {
 	if s.notifier == nil {
@@ -363,7 +421,7 @@ func (s *notificationState) showOrUpdateRebootLocked(body string, actions []noti
 		AppName:       "comin",
 		ReplacesID:    s.rebootID,
 		Summary:       s.summary,
-		Body:          body,
+		Body:          s.withCommitHeader(body),
 		Actions:       actions,
 		ExpireTimeout: notify.ExpireTimeoutNever, // 永不超时
 	}
@@ -718,6 +776,9 @@ func handler(event *protobuf.Event, state *notificationState, c *client.Client) 
 		state.stopBackgroundTimersLocked() // 取消上一周期的延迟关闭/残留 ticker
 		state.scope = ""
 		state.uuid = ""
+		// 提取本次部署的 commit 信息, showOrUpdateLocked 底层会拼到 body 顶部.
+		state.commitSubject = commitSubjectFromMsg(git.SelectedCommitMsg)
+		state.commitShortID = shortID(git.SelectedCommitId)
 		state.persistentMessage = msg
 		state.showOrUpdateLocked(msg, nil)
 	case *protobuf.Event_BuildFinishedType:
@@ -934,6 +995,7 @@ func handleRebootRequired(state *notificationState, c *client.Client) {
 	defer state.mu.Unlock()
 	// 关闭 deploy 通知 (避免 deploy 通知和 reboot 通知同时并存, 造成 UX 混乱).
 	// reboot 通知接管常驻通知槽位, 持续展示直到用户决策或倒计时归零.
+	// 注: closeLocked 不清除 commit 字段, 故 reboot 通知自然延续展示本次部署的 commit header.
 	state.stopBackgroundTimersLocked()
 	state.closeLocked()
 	// 重置 reboot 状态.
@@ -981,6 +1043,8 @@ func scenario(conn *dbus.Conn, state *notificationState) {
 				Git: &protobuf.Git{
 					SelectedRemoteName: "origin",
 					SelectedBranchName: "main",
+					SelectedCommitId:   "a1b2c3d4e5f6a7b8c9d0",
+					SelectedCommitMsg:  "feat(network): enable DAE eBPF routing by default\n\nDetailed body line 1.\nDetailed body line 2.",
 				},
 			},
 		},
