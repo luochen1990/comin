@@ -223,6 +223,38 @@ one of “without”, “auto”, “manual”
 
 
 
+## services\.comin\.deployConfirmer\.reboot_policy
+
+
+
+Conservative policy for generations that need a reboot
+(per rebootConfirmer\.triggers) to take effect\. Only
+relevant when mode = “auto”\.
+null (default): no special handling - the autoconfirm
+timer confirms the deployment as usual\.
+“skip”: on timer expiry, skip the deployment instead of
+confirming it\. The generation is only deployed when the
+user explicitly confirms (e\.g\. the “Deploy now” desktop
+notification button)\. Skipped generations re-enter the
+confirmation flow on the next poll\.
+“manual”: wait indefinitely for user confirmation
+(downgrade auto to manual for these generations)\.
+
+
+
+*Type:*
+one of \<null>, “manual”, “skip”
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+
+
 ## services\.comin\.desktop\.enable
 
 

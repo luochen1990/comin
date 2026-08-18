@@ -75,6 +75,7 @@ var translations = map[string]map[string]string{
 		"deploy_now":      "立即部署",
 		"skip":            "跳过本次",
 		"countdown":       "剩余 %d 秒后自动放行",
+		"countdown_skip":  "剩余 %d 秒后自动跳过 (需要重启的部署仅经手动放行)",
 		"waiting_confirm": "等待你的确认",
 		// reboot 交互通知文案
 		"reboot_now":              "立即重启",
@@ -103,6 +104,7 @@ var translations = map[string]map[string]string{
 		"deploy_now":      "Deploy now",
 		"skip":            "Skip this time",
 		"countdown":       "Auto-confirming in %d seconds",
+		"countdown_skip":  "Auto-skipping in %d seconds (reboot-required deploys need manual approval)",
 		"waiting_confirm": "Waiting for your confirmation",
 		// reboot interactive notification strings
 		"reboot_now":              "Reboot now",
@@ -250,9 +252,12 @@ type notificationState struct {
 	scope   string // "build" / "deploy" - 决定 Confirm 的 for 字段
 	uuid    string // 待确认的 generation uuid
 	// auto 模式倒计时: deadline 归零时刻, ticker 每 countdownInterval 秒刷新 body.
-	deadline time.Time
-	ticker   *time.Ticker
-	stopCh   chan struct{} // 通知 ticker goroutine 退出
+	// countdownKey 决定倒计时文案 ("countdown"=自动放行 / "countdown_skip"=自动跳过),
+	// 每次 ConfirmationSubmitted 按事件 mode 设置, 与 deadline 同生命周期.
+	deadline     time.Time
+	countdownKey string
+	ticker       *time.Ticker
+	stopCh       chan struct{} // 通知 ticker goroutine 退出
 	// doneTimer: 部署完成后延迟关闭常驻通知(让用户看到"部署完成"结果再消失).
 	doneTimer *time.Timer
 	// persistentMessage 是"阶段文案"(phase_building/phase_deploying 等),
@@ -543,17 +548,21 @@ func (s *notificationState) startCountdownLocked() {
 					s.mu.Unlock()
 					return
 				}
+				key := s.countdownKey
+				if key == "" {
+					key = "countdown"
+				}
 				remaining := int(time.Until(s.deadline).Seconds())
 				if remaining <= 0 {
-					// 倒计时归零: 刷新为 0 秒并停止 ticker, 等待主进程 ConfirmationConfirmed 事件关闭通知.
-					// 不在此关闭通知, 因为归零 ≠ 已确认 (主进程 timer 触发仍需几十 ms).
-					body := s.persistentMessage + "\n" + tr("countdown", 0)
+					// 倒计时归零: 刷新为 0 秒并停止 ticker, 等待主进程事件关闭通知.
+					// 不在此关闭通知, 因为归零 ≠ 已确认/已跳过 (主进程 timer 触发仍需几十 ms).
+					body := s.persistentMessage + "\n" + tr(key, 0)
 					s.showOrUpdateLocked(body, persistentActions())
 					s.stopTickerLocked()
 					s.mu.Unlock()
 					return
 				}
-				body := s.persistentMessage + "\n" + tr("countdown", remaining)
+				body := s.persistentMessage + "\n" + tr(key, remaining)
 				s.showOrUpdateLocked(body, persistentActions())
 				s.mu.Unlock()
 			}
@@ -873,7 +882,8 @@ func handler(event *protobuf.Event, state *notificationState, c *client.Client) 
 
 // handleConfirmationSubmitted 处理 confirmation 提交事件, 在已活跃的常驻通知上追加交互.
 //   - without: 立即放行, 不追加按钮(常驻通知保持纯进度展示).
-//   - auto:    追加双按钮 + 倒计时行.
+//   - auto:    追加双按钮 + "自动放行"倒计时行.
+//   - auto-skip: 追加双按钮 + "自动跳过"倒计时行 (reboot_policy=skip 降级后的模式).
 //   - manual:  追加双按钮(无倒计时).
 //
 // 常驻通知通常已由 BuildStarted 开启; 若未开启(BuildStarted 被跳过的边界场景)则此处兜底开启.
@@ -882,17 +892,17 @@ func handleConfirmationSubmitted(cs *protobuf.Event_ConfirmationSubmitted, creat
 	case "without":
 		// 立即放行, 无需用户介入. 常驻通知保持当前 body(构建中).
 		return
-	case "auto", "manual":
+	case "auto", "auto-skip", "manual":
 		// 进入交互式 confirmation.
 	default:
 		logrus.Errorf("unexpected confirmer mode: %s", cs.Mode)
 		return
 	}
 
-	// auto 模式需要倒计时: 从事件 CreatedAt + AutoconfirmDuration 计算归零时刻.
+	// auto / auto-skip 模式需要倒计时: 从事件 CreatedAt + AutoconfirmDuration 计算归零时刻.
 	// ConfirmationSubmitted 事件不携带 duration, 需通过 GetManagerState 读取 deploy_confirmer.
 	var deadline time.Time
-	if cs.Mode == "auto" {
+	if cs.Mode != "manual" {
 		duration := autoconfirmDuration(c)
 		start := time.Now()
 		if createdAt != nil && createdAt.AsTime().Unix() > 0 {
@@ -925,13 +935,20 @@ func handleConfirmationSubmitted(cs *protobuf.Event_ConfirmationSubmitted, creat
 	state.scope = scope
 	state.uuid = cs.Uuid
 	state.persistentMessage = body
-	if cs.Mode == "auto" {
+	if cs.Mode != "manual" {
+		// auto → "自动放行"; auto-skip → "自动跳过" (保守策略降级模式, 文案需向用户
+		// 传达"不点就不会部署").
+		countdownKey := "countdown"
+		if cs.Mode == "auto-skip" {
+			countdownKey = "countdown_skip"
+		}
 		remaining := int(time.Until(deadline).Seconds())
 		if remaining < 0 {
 			remaining = 0
 		}
 		state.deadline = deadline
-		body = body + "\n" + tr("countdown", remaining)
+		state.countdownKey = countdownKey
+		body = body + "\n" + tr(countdownKey, remaining)
 		state.showOrUpdateLocked(body, persistentActions())
 		state.startCountdownLocked()
 	} else {

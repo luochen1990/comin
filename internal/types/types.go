@@ -62,6 +62,12 @@ type Grpc struct {
 type Confirmer struct {
 	Mode         string `yaml:"mode"`
 	AutoDuration int    `yaml:"autoconfirm_duration"`
+	// RebootPolicy 是 needs-reboot generation 的部署保守策略 (仅 deploy confirmer 消费):
+	//   ""       不干预 (默认, 超时照常放行)
+	//   "manual" 降级为无限等待用户确认
+	//   "skip"   倒计时归零自动跳过, 仅用户显式确认才部署
+	// 判定阈值复用 RebootConfirmer.Triggers (SSOT, 见 internal/manager/reboot_policy.go).
+	RebootPolicy string `yaml:"reboot_policy"`
 }
 
 // RebootConfirmer 控制 needs-reboot 交互通知的行为.

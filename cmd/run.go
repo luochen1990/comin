@@ -125,6 +125,20 @@ var runCmd = &cobra.Command{
 			os.Exit(1)
 		}
 		deployConfirmer := manager.NewConfirmer(broker, mode, time.Duration(cfg.DeployConfirmer.AutoDuration)*time.Second, "deploy")
+		// 保守策略: needs-reboot generation 的 deploy confirmation 降级 (详见 internal/manager/reboot_policy.go).
+		// 判定阈值复用 rebootConfirmer.triggers (SSOT); 咨询回调走 store+executor,
+		// 与 manager 在 BuildFinished 时算 pendingChecks 是同一份事实.
+		if err := deployConfirmer.SetRebootPolicy(cfg.DeployConfirmer.RebootPolicy, func(generationUuid string) bool {
+			g, err := store.GenerationGet(generationUuid)
+			if err != nil || g.OutPath == "" {
+				logrus.Warnf("run: cannot consult reboot checks for generation %s: %v", generationUuid, err)
+				return false
+			}
+			return manager.NeedsRebootConfirm(executor.CheckReboot(g.OutPath), cfg.RebootConfirmer.Triggers)
+		}); err != nil {
+			logrus.Error(err)
+			os.Exit(1)
+		}
 		deployConfirmer.Start()
 
 		configurationOperations := manager.ConfigurationOperations{}
