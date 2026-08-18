@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nlewo/comin/internal/broker"
+	"github.com/nlewo/comin/pkg/protobuf"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -327,4 +328,78 @@ func TestConfirmerManualDowngradeOnReboot(t *testing.T) {
 	assert.Never(t, func() bool {
 		return c.status().Confirmed != ""
 	}, 2*time.Second, 100*time.Millisecond)
+}
+
+// 事件级回归网: auto-skip 归零发布 ConfirmationExpired (而非 Cancelled),
+// 且事件 Uuid 正确 — desktop 的 "转等待" 通知切换依赖此事件.
+func TestConfirmerAutoSkipPublishesExpiredEvent(t *testing.T) {
+	bk := broker.New()
+	bk.Start()
+	sub := bk.Subscribe()
+	c := NewConfirmer(bk, Auto, 1*time.Second, "deploy")
+	assert.NoError(t, c.SetRebootPolicy("skip", func(string) bool { return true }))
+	go func() {
+		for range c.confirmed {
+		}
+	}()
+	c.Start()
+
+	c.Submit("uuid1")
+	var gotUuid string
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		for {
+			select {
+			case ev := <-sub:
+				if e, ok := ev.Type.(*protobuf.Event_ConfirmationExpiredType); ok {
+					gotUuid = e.ConfirmationExpiredType.Uuid
+				}
+			default:
+				if gotUuid == "" {
+					assert.Fail(ct, "ConfirmationExpired not published yet")
+				}
+				return
+			}
+		}
+	}, 3*time.Second, 100*time.Millisecond)
+	assert.Equal(t, "uuid1", gotUuid)
+	// 归零走 Expired 而非 Cancelled: 确认等待状态.
+	assert.Equal(t, "uuid1", c.status().Submitted)
+	assert.Equal(t, int64(Manual), c.status().Mode)
+}
+
+// cancel 后无幽灵归零事件 (stale-tick 竞态回归网):
+// cancel 停 timer + 置 nil 后, 即使原归零时刻已过也不得再发 Expired/Confirmed.
+func TestConfirmerCancelNoGhostTimerEvent(t *testing.T) {
+	bk := broker.New()
+	bk.Start()
+	sub := bk.Subscribe()
+	c := NewConfirmer(bk, Auto, 1*time.Second, "deploy")
+	assert.NoError(t, c.SetRebootPolicy("skip", func(string) bool { return true }))
+	go func() {
+		for range c.confirmed {
+		}
+	}()
+	c.Start()
+
+	c.Submit("uuid1")
+	c.Cancel()
+	// 排空订阅通道中已积累的 Submitted/Cancelled 事件.
+	for len(sub) > 0 {
+		<-sub
+	}
+	// 越过原归零时刻: 不得再出现任何 confirmation 生命周期事件.
+	assert.Never(t, func() bool {
+		for {
+			select {
+			case ev := <-sub:
+				switch ev.Type.(type) {
+				case *protobuf.Event_ConfirmationExpiredType, *protobuf.Event_ConfirmationConfirmedType:
+					return true
+				}
+				continue
+			default:
+			}
+			return false
+		}
+	}, 3*time.Second, 100*time.Millisecond)
 }

@@ -78,15 +78,9 @@ func Read(path string) (config types.Configuration, err error) {
 	if config.BuildTimeout == 0 {
 		config.BuildTimeout = 1800
 	}
-	for _, dc := range []struct {
-		field *string
-		name  string
-	}{
-		{&config.BuildConfirmer.RebootPolicy, "build_confirmer.reboot_policy"},
-	} {
-		if *dc.field != "" {
-			return config, fmt.Errorf("config: %s is not supported (conservative reboot policy only applies to deploy_confirmer)", dc.name)
-		}
+	// 保守策略仅适用于 deploy 侧 (build 阶段无 switch, 谈不上 needs-reboot 拦截).
+	if config.BuildConfirmer.RebootPolicy != "" {
+		return config, fmt.Errorf("config: build_confirmer.reboot_policy is not supported (conservative reboot policy only applies to deploy_confirmer)")
 	}
 	logrus.Debugf("Config is '%#v'", config)
 	return

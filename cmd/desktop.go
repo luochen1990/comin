@@ -36,6 +36,7 @@ import (
 	"github.com/esiqveland/notify"
 	"github.com/godbus/dbus/v5"
 	"github.com/nlewo/comin/internal/builder"
+	"github.com/nlewo/comin/internal/manager"
 	"github.com/nlewo/comin/internal/store"
 	"github.com/nlewo/comin/internal/utils"
 	"github.com/nlewo/comin/pkg/client"
@@ -218,16 +219,12 @@ func envIntOr(key string, def int) int {
 	return def
 }
 
-// shouldPromptReboot 根据 rebootConfig.triggers 判断 RebootChecks 是否应触发交互通知.
-// triggers 为 nil 表示 Any() 触发 (默认); 为空切片表示禁用; 否则只触发列出的字段.
+// shouldPromptReboot 委托给 manager.NeedsRebootConfirm (SSOT):
+// deploy confirmation 提示行与主进程 reboot_policy 降级判定必须同源,
+// 避免 "desktop 有提示但策略不拦" 的分裂. nil triggers = Any() 触发,
+// 空 (且非 nil) 切片 = 显式禁用.
 func shouldPromptReboot(checks *protobuf.RebootChecks, cfg rebootConfig) bool {
-	if checks == nil || checks.IsEmpty() {
-		return false
-	}
-	if cfg.triggers == nil {
-		return checks.Any()
-	}
-	return checks.AnyTriggered(cfg.triggers)
+	return manager.NeedsRebootConfirm(checks, cfg.triggers)
 }
 
 // rebootActions 返回 reboot 交互通知的双按钮 (经 i18n).
@@ -552,21 +549,19 @@ func (s *notificationState) startCountdownLocked() {
 					s.mu.Unlock()
 					return
 				}
-				key := s.countdownKey
-				if key == "" {
-					key = "countdown"
-				}
+				// countdownKey 由唯一写入点 (handleConfirmationSubmitted) 在
+				// startCountdownLocked 之前设置, 无需 fallback.
 				remaining := int(time.Until(s.deadline).Seconds())
 				if remaining <= 0 {
 					// 倒计时归零: 刷新为 0 秒并停止 ticker, 等待主进程事件关闭通知.
 					// 不在此关闭通知, 因为归零 ≠ 已确认/已跳过 (主进程 timer 触发仍需几十 ms).
-					body := s.persistentMessage + "\n" + tr(key, 0)
+					body := s.persistentMessage + "\n" + tr(s.countdownKey, 0)
 					s.showOrUpdateLocked(body, persistentActions())
 					s.stopTickerLocked()
 					s.mu.Unlock()
 					return
 				}
-				body := s.persistentMessage + "\n" + tr(key, remaining)
+				body := s.persistentMessage + "\n" + tr(s.countdownKey, remaining)
 				s.showOrUpdateLocked(body, persistentActions())
 				s.mu.Unlock()
 			}
@@ -882,7 +877,18 @@ func handler(event *protobuf.Event, state *notificationState, c *client.Client) 
 		// 常驻通知保留 (按钮保留), body 切换到 "等待确认" — 用户随时可点 "立即部署".
 		state.mu.Lock()
 		state.stopTickerLocked()
-		state.persistentMessage = tr("waiting_confirm")
+		// 回填 uuid/scope: 若用户在倒计时内手动关闭过通知 (OnClosed 已清空字段),
+		// 归零事件会以 ReplacesID=0 复活一条新通知 — 不回填则按钮是死的.
+		// (与 handleConfirmationSubmitted 的既有技术债务注释一致, scope 固定 deploy.)
+		state.uuid = v.ConfirmationExpiredType.Uuid
+		state.scope = "deploy"
+		body := tr("waiting_confirm")
+		// 保留 "⚠ 切换后需要重启" 提示行: manual 等待阶段是用户做部署决策的时刻,
+		// reboot 依据不能丢 (与 handleConfirmationSubmitted 的提示行同源).
+		if shouldPromptReboot(state.pendingChecks, state.rebootCfg) {
+			body = body + "\n" + tr("reboot_pending_hint", state.pendingChecks.Reason())
+		}
+		state.persistentMessage = body
 		state.showOrUpdateLocked(state.persistentMessage, persistentActions())
 		state.mu.Unlock()
 	case *protobuf.Event_ConfirmationCancelledType:
@@ -900,12 +906,14 @@ func handler(event *protobuf.Event, state *notificationState, c *client.Client) 
 //
 // 常驻通知通常已由 BuildStarted 开启; 若未开启(BuildStarted 被跳过的边界场景)则此处兜底开启.
 func handleConfirmationSubmitted(cs *protobuf.Event_ConfirmationSubmitted, createdAt *timestamppb.Timestamp, state *notificationState, c *client.Client) {
+	needCountdown := false
 	switch cs.Mode {
 	case "without":
 		// 立即放行, 无需用户介入. 常驻通知保持当前 body(构建中).
 		return
-	case "auto", "auto-skip", "manual":
-		// 进入交互式 confirmation.
+	case "auto", "auto-skip":
+		needCountdown = true
+	case "manual":
 	default:
 		logrus.Errorf("unexpected confirmer mode: %s", cs.Mode)
 		return
@@ -914,7 +922,7 @@ func handleConfirmationSubmitted(cs *protobuf.Event_ConfirmationSubmitted, creat
 	// auto / auto-skip 模式需要倒计时: 从事件 CreatedAt + AutoconfirmDuration 计算归零时刻.
 	// ConfirmationSubmitted 事件不携带 duration, 需通过 GetManagerState 读取 deploy_confirmer.
 	var deadline time.Time
-	if cs.Mode != "manual" {
+	if needCountdown {
 		duration := autoconfirmDuration(c)
 		start := time.Now()
 		if createdAt != nil && createdAt.AsTime().Unix() > 0 {
@@ -931,7 +939,7 @@ func handleConfirmationSubmitted(cs *protobuf.Event_ConfirmationSubmitted, creat
 	// 根治需要在 protobuf Event.ConfirmationSubmitted 增加 confirmer_type 字段.
 	scope := "deploy"
 	body := tr("phase_waiting")
-	if cs.Mode == "manual" {
+	if !needCountdown {
 		body = tr("waiting_confirm")
 	}
 
@@ -947,7 +955,7 @@ func handleConfirmationSubmitted(cs *protobuf.Event_ConfirmationSubmitted, creat
 	state.scope = scope
 	state.uuid = cs.Uuid
 	state.persistentMessage = body
-	if cs.Mode != "manual" {
+	if needCountdown {
 		// auto → "自动放行"; auto-skip → "自动跳过" (保守策略降级模式, 文案需向用户
 		// 传达"不点就不会部署").
 		countdownKey := "countdown"

@@ -46,38 +46,22 @@ func parseRebootPolicy(s string) (string, error) {
 }
 
 // downgradeMode 计算当前 mode 在保守策略下的降级结果.
-// 输入 mode 必须已通过 ParseMode 校验; 返回值是实际生效的 Mode 与事件流 mode 字符串.
+// 输入 mode 必须已通过 ParseMode 校验 (configuredMode).
 //
 //	无策略 或 非 NeedsRebootConfirm 或 mode 已是 Manual/Without → 原样返回
 //	auto + policy=skip                                           → AutoSkip
 //	auto + policy=manual                                         → Manual
-func downgradeMode(mode Mode, rebootPolicy string, needsRebootConfirm bool) (Mode, string) {
+func downgradeMode(mode Mode, rebootPolicy string, needsRebootConfirm bool) Mode {
 	if !needsRebootConfirm || rebootPolicy == rebootPolicyNone || mode != Auto {
-		return mode, modeString(mode)
+		return mode
 	}
 	switch rebootPolicy {
 	case rebootPolicySkip:
-		return AutoSkip, modeString(AutoSkip)
+		return AutoSkip
 	case rebootPolicyManual:
-		return Manual, modeString(Manual)
+		return Manual
 	}
-	return mode, modeString(mode)
-}
-
-// modeString 返回 Mode 的事件流字符串表示 (ConfirmationSubmitted.mode 字段值).
-// auto-skip 是新增值: desktop 侧据此把倒计时文案从 "自动放行" 换成 "自动跳过".
-func modeString(mode Mode) string {
-	switch mode {
-	case Manual:
-		return "manual"
-	case Auto:
-		return "auto"
-	case AutoSkip:
-		return "auto-skip"
-	case Without:
-		return "without"
-	}
-	return "unknown"
+	return mode
 }
 
 // NeedsRebootConfirm 判定 generation 的 reboot 检查结果是否命中保守策略阈值.

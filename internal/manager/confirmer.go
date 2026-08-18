@@ -43,6 +43,23 @@ func ParseMode(s string) (Mode, error) {
 	}
 }
 
+// modeString 返回 Mode 的事件流字符串表示 (ConfirmationSubmitted.mode 字段值).
+// 与 ParseMode 刻意不对称: ParseMode 是配置入口, 必须拒绝 "auto-skip"
+// (运行时降级专用模式, 不可由用户配置); modeString 是事件流出口, 覆盖全部值.
+func modeString(mode Mode) string {
+	switch mode {
+	case Manual:
+		return "manual"
+	case Auto:
+		return "auto"
+	case AutoSkip:
+		return "auto-skip"
+	case Without:
+		return "without"
+	}
+	return "unknown"
+}
+
 // Confirmer allows to handle user confirmations. A generation is
 // submitted to the confirmer. Once a generation has been confirmed,
 // it is pushed to the submit channel.
@@ -135,6 +152,19 @@ func (c *Confirmer) Start() {
 	go c.start()
 }
 
+// stopTimer 停止并丢弃挂起的 autoconfirm timer (幂等).
+// 除 Stop() 外还把 c.timer 置 nil: Stop 不排空已入 channel 缓冲的 tick,
+// 只有置 nil (select 的 <-timer 变 nil channel 永久阻塞) 才能免疫
+// "tick 已触发 + select 同轮先选了其他分支" 的 stale-tick 竞态
+// (该竞态下 Auto 模式会误放行用户刚 cancel 的 generation).
+// 调用方需自行把 start() 的局部变量 timer 置 nil (闭包不可达).
+func (c *Confirmer) stopTimer() {
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+}
+
 func (c *Confirmer) start() {
 	logrus.Infof("confirmer: starting with the autoconfirm duration: %d seconds", c.state.AutoconfirmDuration)
 	var timer <-chan time.Time
@@ -149,24 +179,19 @@ func (c *Confirmer) start() {
 				notified = false
 				c.state.Submitted = command.uuid
 				// 无条件停掉上一个 confirmation 残留的 timer:
-				// 1. confirm/cancel 分支各自停 timer, 但 submit 前的模式可能是 Manual
-				//    (reboot_policy 降级) 而上一个 confirmation 是 Auto — 不停的话
-				//    stale timer 会按 auto-confirm 路径误放行 manual 等待中的 generation.
-				// 2. Stop 后旧 channel 不再有值, 但显式置 nil 让 select 的 <-timer 永久阻塞, 语义更明确.
-				if c.timer != nil {
-					c.timer.Stop()
-					c.timer = nil
-					timer = nil
-				}
+				// submit 前的 confirmation 模式可能是 Auto 而本次降级为 Manual
+				// (reboot_policy) 或反之 — 不停的话 stale timer 会按旧模式归零.
+				c.stopTimer()
+				timer = nil
 				// 保守策略降级: needs-reboot generation 不自动放行 (详见 reboot_policy.go).
 				// 咨询是同步回调 (store 读 + 文件比较, 毫秒级), 在事件循环内执行可接受 —
 				// 与 manager.Run 循环消费 DeploymentDoneCh 的既有并发模型一致.
 				// 每次都从 configuredMode 出发, 降级不跨 generation 累积.
 				needsReboot := c.rebootConsult != nil && c.rebootConsult(command.uuid)
-				mode, modeStr := downgradeMode(c.configuredMode, c.rebootPolicy, needsReboot)
+				mode := downgradeMode(c.configuredMode, c.rebootPolicy, needsReboot)
 				if mode != c.configuredMode {
 					logrus.Infof("confirmer: generation %s needs reboot, downgrading mode from %s to %s",
-						command.uuid, modeString(c.configuredMode), modeStr)
+						command.uuid, modeString(c.configuredMode), modeString(mode))
 				}
 				// state.Mode 反映本次 confirmation 实际生效的模式 (status/desktop/CLI 展示).
 				c.state.Mode = int64(mode)
@@ -183,36 +208,34 @@ func (c *Confirmer) start() {
 					}
 					logrus.Infof("confirmer: generation %s has been submitted and will be %s in %d seconds",
 						command.uuid, action, c.state.AutoconfirmDuration)
-					if c.timer != nil {
-						c.timer.Stop()
-					}
 					c.timer = time.NewTimer(time.Duration(c.state.AutoconfirmDuration) * time.Second)
 					timer = c.timer.C
 					c.state.AutoconfirmStarted = wrapperspb.Bool(true)
 					c.state.AutoconfirmStartedAt = timestamppb.New(time.Now().UTC())
 				}
 				// Notify subscribers that a generation entered the confirmation flow (buffer window started / immediate / not needed)
-				submittedEvent := &protobuf.Event_ConfirmationSubmitted{Mode: modeStr, Uuid: command.uuid}
+				submittedEvent := &protobuf.Event_ConfirmationSubmitted{Mode: modeString(mode), Uuid: command.uuid}
 				c.broker.Publish(&protobuf.Event{Type: &protobuf.Event_ConfirmationSubmittedType{ConfirmationSubmittedType: submittedEvent}, CreatedAt: timestamppb.New(time.Now().UTC())})
 			case "confirm":
 				logrus.Infof("confirmer: generation %s has been confirmed", command.uuid)
 				// 停掉挂起的 auto/auto-skip timer: 已确认的 confirmation 不应再被
 				// 归零事件干扰 (auto-skip 归零会转 manual, auto 归零会重复 confirm).
-				if c.timer != nil {
-					c.timer.Stop()
-					c.timer = nil
-					timer = nil
-				}
+				c.stopTimer()
+				timer = nil
 				c.state.Confirmed = command.uuid
 				e := &protobuf.Event_ConfirmationConfirmed{Uuid: command.uuid}
 				c.broker.Publish(&protobuf.Event{Type: &protobuf.Event_ConfirmationConfirmedType{ConfirmationConfirmedType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
 			case "cancel":
+				// 注: cancel 不清 Submitted — 被显式跳过的 generation 仍可通过 CLI
+				// `comin confirmation accept` 反悔放行 (fetcher 对相同 commit 去重,
+				// 无 poll 重入路径, 这是唯一反悔入口; 见 reboot_policy.go 头注释).
 				logrus.Infof("confirmer: confirmation of generation %s has been cancelled", command.uuid)
 				c.state.Confirmed = ""
 				c.state.AutoconfirmStarted = wrapperspb.Bool(false)
-				if c.timer != nil {
-					c.timer.Stop()
-				}
+				// 停 timer + 置 nil: 防御 "归零瞬间点击跳过" 的 stale-tick 竞态
+				// (Auto 模式下 ghost tick 会误放行刚被 cancel 的 generation).
+				c.stopTimer()
+				timer = nil
 				e := &protobuf.Event_ConfirmationCancelled{Uuid: command.uuid}
 				c.broker.Publish(&protobuf.Event{Type: &protobuf.Event_ConfirmationCancelledType{ConfirmationCancelledType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
 			}
