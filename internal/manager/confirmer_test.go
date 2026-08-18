@@ -174,8 +174,8 @@ func TestConfirmerConfirmBeforeSubmit(t *testing.T) {
 
 // --- reboot_policy 行为测试 ---
 
-// auto-skip: needs-reboot generation 在倒计时归零后被跳过 (不 confirm),
-// 且状态字段复位 (可供下一个 generation 重新提交).
+// auto-skip: needs-reboot generation 在倒计时归零后转入 manual 等待 (不 confirm),
+// Submitted 保留 — 用户显式 Confirm 是唯一放行途径.
 func TestConfirmerAutoSkipOnReboot(t *testing.T) {
 	bk := broker.New()
 	bk.Start()
@@ -194,13 +194,13 @@ func TestConfirmerAutoSkipOnReboot(t *testing.T) {
 		assert.Equal(ct, int64(AutoSkip), c.status().Mode)
 	}, 1*time.Second, 100*time.Millisecond)
 
-	// 归零后: 不放行 (confirmed 通道无消息), 状态复位.
+	// 归零后: 不放行, 转入 manual 等待 (Submitted 保留, Mode=Manual, 倒计时结束).
 	assert.Never(t, func() bool {
 		return len(confirmed) != 0
 	}, 1*time.Second, 100*time.Millisecond)
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		assert.Equal(ct, "", c.status().Submitted)
-		assert.Equal(ct, "", c.status().Confirmed)
+		assert.Equal(ct, "uuid1", c.status().Submitted)
+		assert.Equal(ct, int64(Manual), c.status().Mode)
 		assert.False(ct, c.status().AutoconfirmStarted.GetValue())
 	}, 4*time.Second, 100*time.Millisecond)
 	select {
@@ -210,11 +210,12 @@ func TestConfirmerAutoSkipOnReboot(t *testing.T) {
 	}
 }
 
-// auto-skip 窗口内用户显式确认: 照常放行 (点击 "立即部署" 是唯一部署途径).
+// auto-skip 窗口内用户显式确认: 照常放行 (点击 "立即部署" 是唯一部署途径),
+// 且归零后的 stale timer 不会干扰 (无幽灵事件).
 func TestConfirmerAutoSkipUserOverrides(t *testing.T) {
 	bk := broker.New()
 	bk.Start()
-	c := NewConfirmer(bk, Auto, 3*time.Second, "deploy")
+	c := NewConfirmer(bk, Auto, 2*time.Second, "deploy")
 	assert.NoError(t, c.SetRebootPolicy("skip", func(string) bool { return true }))
 	var expectedUuid atomic.Bool
 	go func() {
@@ -234,10 +235,14 @@ func TestConfirmerAutoSkipUserOverrides(t *testing.T) {
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
 		assert.True(ct, expectedUuid.Load())
 	}, 1*time.Second, 100*time.Millisecond)
+	// 等过原 timer 归零时刻: confirm 后状态保持干净, 不出现幽灵 cancel/expire.
+	time.Sleep(3 * time.Second)
+	assert.Equal(t, "", c.status().Submitted)
+	assert.Equal(t, "", c.status().Confirmed)
 }
 
-// 降级不跨 generation 累积: needs-reboot 的 uuid1 被降级跳过后,
-// 无需 reboot 的 uuid2 仍走普通 auto 放行.
+// 降级不跨 generation 累积: needs-reboot 的 uuid1 归零转等待后,
+// 无需 reboot 的 uuid2 提交时仍走普通 auto 放行 (且 uuid1 的等待被替代).
 func TestConfirmerDowngradeNotSticky(t *testing.T) {
 	bk := broker.New()
 	bk.Start()
@@ -257,9 +262,9 @@ func TestConfirmerDowngradeNotSticky(t *testing.T) {
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
 		assert.Equal(ct, int64(AutoSkip), c.status().Mode)
 	}, 1*time.Second, 100*time.Millisecond)
-	// 等 uuid1 被 timer 跳过 (2s 归零 + 状态复位).
+	// 等 uuid1 归零转 manual 等待.
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		assert.Equal(ct, "", c.status().Submitted)
+		assert.Equal(ct, int64(Manual), c.status().Mode)
 	}, 4*time.Second, 100*time.Millisecond)
 
 	needs = false
@@ -270,6 +275,40 @@ func TestConfirmerDowngradeNotSticky(t *testing.T) {
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
 		assert.Equal(ct, "uuid2", got.Load())
 	}, 4*time.Second, 100*time.Millisecond)
+}
+
+// 交错场景 (Review 发现的回归): gen1 (Auto, 无需 reboot) 提交后 60s 窗口内
+// gen2 (needs-reboot, 降级 Manual) 到达 — gen1 的 stale timer 不得误放行 gen2.
+func TestConfirmerAutoThenManualDowngradeNoStaleTimerLeak(t *testing.T) {
+	bk := broker.New()
+	bk.Start()
+	needs := false
+	c := NewConfirmer(bk, Auto, 2*time.Second, "deploy")
+	assert.NoError(t, c.SetRebootPolicy("manual", func(string) bool { return needs }))
+	go func() {
+		for range c.confirmed {
+		}
+	}()
+	c.Start()
+
+	needs = false
+	c.Submit("uuid1") // 普通 auto, 2s timer 武装
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		assert.Equal(ct, int64(Auto), c.status().Mode)
+	}, 1*time.Second, 100*time.Millisecond)
+
+	needs = true
+	c.Submit("uuid2") // 降级 manual (替代 uuid1; submit 无条件停旧 timer)
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		assert.Equal(ct, "uuid2", c.status().Submitted)
+		assert.Equal(ct, int64(Manual), c.status().Mode)
+	}, 1*time.Second, 100*time.Millisecond)
+
+	// 越过 uuid1 的归零时刻: uuid2 不得被 stale timer 自动放行.
+	assert.Never(t, func() bool {
+		return c.status().Confirmed != ""
+	}, 3*time.Second, 100*time.Millisecond)
+	assert.Equal(t, "uuid2", c.status().Submitted)
 }
 
 // reboot_policy=manual: needs-reboot generation 降级为无限等待, 不放行.

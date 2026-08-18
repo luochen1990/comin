@@ -18,6 +18,10 @@
 //	DeploymentStarted  → 刷新常驻, body="<commit header>\n正在部署", 去按钮
 //	DeploymentFinished → 刷新常驻, body="<commit header>\n部署完成", 去按钮; 由 doneTimer 延迟关闭
 //	下一周期 BuildStarted → replaces_id 复用同一条通知(或上一条已被 doneTimer 关闭则新开)
+//
+// auto-skip (reboot_policy=skip 的 needs-reboot generation): ConfirmationSubmitted
+// 携带 mode="auto-skip", 倒计时文案为 "自动跳过"; 归零时主进程发 ConfirmationExpired
+// (而非 Cancelled), desktop 把 body 切到 "等待你的确认" 并保留按钮 — 通知常驻成为部署入口.
 package cmd
 
 import (
@@ -872,6 +876,14 @@ func handler(event *protobuf.Event, state *notificationState, c *client.Client) 
 		// 已确认: 停止倒计时, 但常驻通知保留(紧接着的 DeploymentStarted 会刷新它).
 		state.mu.Lock()
 		state.stopTickerLocked()
+		state.mu.Unlock()
+	case *protobuf.Event_ConfirmationExpiredType:
+		// auto-skip 倒计时归零: confirmation 未被取消, 转入 manual 等待.
+		// 常驻通知保留 (按钮保留), body 切换到 "等待确认" — 用户随时可点 "立即部署".
+		state.mu.Lock()
+		state.stopTickerLocked()
+		state.persistentMessage = tr("waiting_confirm")
+		state.showOrUpdateLocked(state.persistentMessage, persistentActions())
 		state.mu.Unlock()
 	case *protobuf.Event_ConfirmationCancelledType:
 		// 已取消: 关闭常驻通知, 发瞬时提示.

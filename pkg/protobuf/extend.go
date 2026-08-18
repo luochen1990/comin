@@ -41,6 +41,9 @@ func (event *Event) Short() string {
 		eventType = "cf-cancelled   "
 	case *Event_ConfirmationConfirmedType:
 		eventType = "cf-confirmed   "
+	case *Event_ConfirmationExpiredType:
+		eventType = "cf-expired     "
+		payload = fmt.Sprintf("uuid=%s", t.ConfirmationExpiredType.Uuid)
 	case *Event_Resume_:
 		eventType = "resume         "
 	case *Event_Suspend_:

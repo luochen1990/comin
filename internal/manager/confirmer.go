@@ -22,10 +22,11 @@ const (
 	Auto
 	// Immediately confirm the submitted generation
 	Without
-	// Skip the generation after several seconds unless the user
-	// explicitly confirms it. This is a runtime-downgraded Auto
-	// (reboot_policy=skip on a needs-reboot generation): the timer
-	// fires a cancel instead of a confirm.
+	// Skip-then-wait mode: after the autoconfirm timer expires, fall
+	// back to waiting for the user instead of confirming. This is a
+	// runtime-downgraded Auto (reboot_policy=skip on a needs-reboot
+	// generation): the timer publishes ConfirmationExpired and the
+	// confirmer keeps waiting (as Manual) for an explicit Confirm.
 	AutoSkip
 )
 
@@ -147,6 +148,16 @@ func (c *Confirmer) start() {
 			case "submit":
 				notified = false
 				c.state.Submitted = command.uuid
+				// 无条件停掉上一个 confirmation 残留的 timer:
+				// 1. confirm/cancel 分支各自停 timer, 但 submit 前的模式可能是 Manual
+				//    (reboot_policy 降级) 而上一个 confirmation 是 Auto — 不停的话
+				//    stale timer 会按 auto-confirm 路径误放行 manual 等待中的 generation.
+				// 2. Stop 后旧 channel 不再有值, 但显式置 nil 让 select 的 <-timer 永久阻塞, 语义更明确.
+				if c.timer != nil {
+					c.timer.Stop()
+					c.timer = nil
+					timer = nil
+				}
 				// 保守策略降级: needs-reboot generation 不自动放行 (详见 reboot_policy.go).
 				// 咨询是同步回调 (store 读 + 文件比较, 毫秒级), 在事件循环内执行可接受 —
 				// 与 manager.Run 循环消费 DeploymentDoneCh 的既有并发模型一致.
@@ -185,6 +196,13 @@ func (c *Confirmer) start() {
 				c.broker.Publish(&protobuf.Event{Type: &protobuf.Event_ConfirmationSubmittedType{ConfirmationSubmittedType: submittedEvent}, CreatedAt: timestamppb.New(time.Now().UTC())})
 			case "confirm":
 				logrus.Infof("confirmer: generation %s has been confirmed", command.uuid)
+				// 停掉挂起的 auto/auto-skip timer: 已确认的 confirmation 不应再被
+				// 归零事件干扰 (auto-skip 归零会转 manual, auto 归零会重复 confirm).
+				if c.timer != nil {
+					c.timer.Stop()
+					c.timer = nil
+					timer = nil
+				}
 				c.state.Confirmed = command.uuid
 				e := &protobuf.Event_ConfirmationConfirmed{Uuid: command.uuid}
 				c.broker.Publish(&protobuf.Event{Type: &protobuf.Event_ConfirmationConfirmedType{ConfirmationConfirmedType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
@@ -200,15 +218,16 @@ func (c *Confirmer) start() {
 			}
 		case <-timer:
 			if Mode(c.state.Mode) == AutoSkip {
-				// auto-skip: 归零跳过而非放行. 复用 cancel 语义 (ConfirmationCancelled 事件
-				// 已被 desktop 消费: 关常驻通知 + 瞬时 "已取消" 提示), 不新增事件类型.
-				logrus.Infof("confirmer: timer skipped generation %s (reboot_policy=skip)", c.state.Submitted)
-				skipped := c.state.Submitted
+				// auto-skip 归零: 转入 manual 等待 (Submitted 保留), 通知常驻成为部署入口.
+				// 设计考量: fetcher 对相同 commit 去重, "跳过后等下个 poll 重进确认" 不成立 —
+				// 若归零即取消, 该 generation 在进程存活期间将无恢复途径 (仅重启 comin / push 新 commit).
+				// 故超时后不取消: 停倒计时, 发 mode 转换事件让 desktop 把文案切到 "等待确认",
+				// 用户随时可点 "立即部署" (Confirm) 或 "跳过本次" (Cancel).
+				logrus.Infof("confirmer: auto-skip expired for generation %s, waiting for manual confirmation (reboot_policy=skip)", c.state.Submitted)
 				c.state.AutoconfirmStarted = wrapperspb.Bool(false)
-				c.state.Confirmed = ""
-				c.state.Submitted = ""
-				e := &protobuf.Event_ConfirmationCancelled{Uuid: skipped}
-				c.broker.Publish(&protobuf.Event{Type: &protobuf.Event_ConfirmationCancelledType{ConfirmationCancelledType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
+				c.state.Mode = int64(Manual)
+				e := &protobuf.Event_ConfirmationExpired{Uuid: c.state.Submitted}
+				c.broker.Publish(&protobuf.Event{Type: &protobuf.Event_ConfirmationExpiredType{ConfirmationExpiredType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
 				continue
 			}
 			logrus.Infof("confirmer: timer confirmed generation %s", c.state.Submitted)

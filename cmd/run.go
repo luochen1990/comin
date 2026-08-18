@@ -128,6 +128,9 @@ var runCmd = &cobra.Command{
 		// 保守策略: needs-reboot generation 的 deploy confirmation 降级 (详见 internal/manager/reboot_policy.go).
 		// 判定阈值复用 rebootConfirmer.triggers (SSOT); 咨询回调走 store+executor,
 		// 与 manager 在 BuildFinished 时算 pendingChecks 是同一份事实.
+		// consult 失败 (查不到 generation/OutPath 空) 选 fail-open (返回 false, 照常 auto-confirm):
+		// submit 路径来自刚成功 GenerationGet 的 BuildDone, 失败概率极低; 而 fail-closed 会把
+		// 每个 lookup 异常都变成无限等待, 可用性损失大于误放行的风险.
 		if err := deployConfirmer.SetRebootPolicy(cfg.DeployConfirmer.RebootPolicy, func(generationUuid string) bool {
 			g, err := store.GenerationGet(generationUuid)
 			if err != nil || g.OutPath == "" {

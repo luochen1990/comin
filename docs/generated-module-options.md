@@ -232,11 +232,11 @@ Conservative policy for generations that need a reboot
 relevant when mode = “auto”\.
 null (default): no special handling - the autoconfirm
 timer confirms the deployment as usual\.
-“skip”: on timer expiry, skip the deployment instead of
-confirming it\. The generation is only deployed when the
-user explicitly confirms (e\.g\. the “Deploy now” desktop
-notification button)\. Skipped generations re-enter the
-confirmation flow on the next poll\.
+“skip”: on timer expiry, fall back to waiting for the
+user instead of confirming\. The generation is only
+deployed when the user explicitly confirms (e\.g\. the
+“Deploy now” desktop notification button); the
+notification stays with its action buttons\.
 “manual”: wait indefinitely for user confirmation
 (downgrade auto to manual for these generations)\.
 

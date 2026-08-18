@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/nlewo/comin/pkg/client"
 	"github.com/nlewo/comin/internal/manager"
+	"github.com/nlewo/comin/pkg/client"
 	"github.com/nlewo/comin/pkg/protobuf"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -75,9 +75,11 @@ func confirmerShow(c *protobuf.Confirmer, for_ string) {
 	if c.Submitted != "" {
 		empty = false
 		fmt.Printf("Confirmation needed for %s: %s\n", for_, c.Submitted)
-		if c.Mode == int64(manager.Auto) {
+		switch manager.Mode(c.Mode) {
+		case manager.Auto:
 			fmt.Printf("  Auto confirmation in %s\n", humanize.Time(c.AutoconfirmStartedAt.AsTime().Add(time.Duration(c.AutoconfirmDuration*int64(time.Second)))))
-
+		case manager.AutoSkip:
+			fmt.Printf("  Auto-skipping (reboot policy) in %s, then waiting for manual confirmation\n", humanize.Time(c.AutoconfirmStartedAt.AsTime().Add(time.Duration(c.AutoconfirmDuration*int64(time.Second)))))
 		}
 	}
 	if empty {

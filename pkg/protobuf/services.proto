@@ -42,6 +42,10 @@ message Event {
     Generation generation = 1;
   }
   message ConfirmationSubmitted {
+    // confirmer mode at submit time: "manual" | "auto" | "without" |
+    // "auto-skip" (runtime-downgraded auto via deploy_confirmer.reboot_policy
+    // on a needs-reboot generation; on timer expiry the confirmer falls back
+    // to waiting, emitting ConfirmationExpired instead of confirming).
     string mode = 1;
     string uuid = 2;
   }
@@ -51,6 +55,11 @@ message Event {
   message ConfirmationConfirmed {
     string origin = 1; 
     string uuid = 2;
+  }
+  // auto-skip 倒计时归零: confirmation 未取消, 从 auto-skip 转入 manual 等待.
+  // desktop 据此把倒计时文案切换为 "等待你的确认" (通知与按钮保留).
+  message ConfirmationExpired {
+    string uuid = 1;
   }
   message Resume {
   }
@@ -108,6 +117,7 @@ message Event {
     RebootRequired rebootRequired = 12;
     ManagerState managerState = 13;
     Fetched fetched = 14;
+    ConfirmationExpired confirmationExpiredType = 17;
     Log log = 16;
   }
   google.protobuf.Timestamp createdAt = 15;
@@ -240,6 +250,10 @@ message Builder {
 }
 
 message Confirmer {
+  // 0=manual 1=auto 2=without 3=auto-skip (runtime-downgraded auto, see
+  // ConfirmationSubmitted.mode). mode reflects the effective mode of the
+  // CURRENT confirmation (may be downgraded per-generation) and can change
+  // over its lifetime (auto-skip falls back to manual on timer expiry).
   int64 mode = 1;
   string submitted = 2;
   string confirmed = 3;

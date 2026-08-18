@@ -4,7 +4,7 @@
 // 用户态服务已是新版, 内核/initrd 仍是旧的. 此时若无人在场, 自动放行是危险的.
 // 本文件把 "该 generation 是否需要 reboot" 的事实映射为 confirmer 行为的降级:
 //
-//	auto + reboot_policy=skip  → auto-skip  (倒计时归零自动跳过, 仅用户点击"立即部署"才 switch)
+//	auto + reboot_policy=skip  → auto-skip  (倒计时归零转入 manual 等待, 仅用户点击"立即部署"才 switch)
 //	auto + reboot_policy=manual→ manual     (无限等待用户确认)
 //	其他组合                    → 不变
 //
@@ -12,9 +12,11 @@
 // "⚠ 切换后需要重启" 使用同一份 AnyTriggered(triggers) 语义,
 // 用户在哪看到提示, 哪个策略就在哪生效, 不会出现 "desktop 有提示但策略不拦" 的分裂.
 //
-// 显式跳过的代偿: 跳过的 generation 因 IsAlreadyDeployed 恒为 false,
-// 下一个 poll 周期 (默认 60s) 会重新进入 confirmation. 用户点击 "立即部署" 即可放行;
-// 一直不管则系统保持旧 generation 运行 (保守目标达成), 无需额外重试机制.
+// 显式跳过的语义: fetcher 对相同 commit 去重, "跳过后等下个 poll 重进确认" 不可达 —
+// 若归零即取消, 该 generation 在进程存活期间将无恢复途径. 故 skip 的归零动作不是取消,
+// 而是 "转入 manual 等待" (Event_ConfirmationExpired): 通知常驻保留按钮, 用户随时可点
+// "立即部署" (Confirm) 放行; 用户也可点 "跳过本次" (Cancel) 显式拒绝. 无人操作时系统
+// 保持旧 generation 运行 (保守目标达成).
 package manager
 
 import (
@@ -29,7 +31,8 @@ const (
 	rebootPolicyNone = ""
 	// rebootPolicyManual needs-reboot 时降级为 manual 模式 (无限等待).
 	rebootPolicyManual = "manual"
-	// rebootPolicySkip needs-reboot 时降级为 auto-skip 模式 (归零跳过).
+	// rebootPolicySkip needs-reboot 时降级为 auto-skip 模式
+	// (倒计时归零转入 manual 等待, 见文件头 "显式跳过的语义").
 	rebootPolicySkip = "skip"
 )
 
