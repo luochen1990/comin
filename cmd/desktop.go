@@ -772,21 +772,27 @@ func handler(event *protobuf.Event, state *notificationState, c *client.Client) 
 		}
 	case *protobuf.Event_BuildStartedType:
 		g := v.BuildStartedType.Generation
+		git := getGitFromGeneration(g)
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		// commit header 在 BuildReason gate 之前无条件刷新:
+		// 指纹缓存命中的 generation 走 already-built 快路径 (builder.Eval 内
+		// IsStorePathExist 命中直接 GenerationBuildStart(AlreadyBuilt)), 其
+		// BuildStarted 事件被下方 gate 跳过 (不开"正在构建"通知), 但 commit 信息
+		// 必须更新 — 否则 commitSubject/commitShortID 跨周期残留 (closeLocked
+		// 刻意不清除它们), 后续 confirmation/deploy/done 通知 header 展示的是
+		// 上一个 need-build 周期的旧 commit msg.
+		state.commitSubject = commitSubjectFromMsg(git.SelectedCommitMsg)
+		state.commitShortID = shortID(git.SelectedCommitId)
 		if g.BuildReason != builder.BuildReasonNeedBuild {
 			break
 		}
 		// 开启(或复用)常驻通知, 进入构建阶段. 无按钮.
-		git := getGitFromGeneration(g)
 		msg := tr("phase_building", git.SelectedRemoteName, git.SelectedBranchName)
-		state.mu.Lock()
-		defer state.mu.Unlock()
 		state.cycle++                      // 新周期: 递增周期号, 使上一周期的 doneTimer 回调身份校验失效
 		state.stopBackgroundTimersLocked() // 取消上一周期的延迟关闭/残留 ticker
 		state.scope = ""
 		state.uuid = ""
-		// 提取本次部署的 commit 信息, showOrUpdateLocked 底层会拼到 body 顶部.
-		state.commitSubject = commitSubjectFromMsg(git.SelectedCommitMsg)
-		state.commitShortID = shortID(git.SelectedCommitId)
 		state.persistentMessage = msg
 		state.showOrUpdateLocked(msg, nil)
 	case *protobuf.Event_BuildFinishedType:
