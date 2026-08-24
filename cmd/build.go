@@ -22,7 +22,7 @@ var buildCmd = &cobra.Command{
 		} else {
 			systemAttr = "nixosConfigurations"
 		}
-		executor, _ := executor.NewGitNixFlake(systemAttr, ".", false)
+		executor, _ := executor.NewGitNixFlake(systemAttr, ".", false, "")
 		if hostname != "" {
 			hosts[0] = hostname
 		} else {

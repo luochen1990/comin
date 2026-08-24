@@ -96,7 +96,7 @@ func TestBuild(t *testing.T) {
 		return false, "profile-path", nil
 	}
 	d := deployer.New(s, deployFunc, nil, "", bk)
-	e, _ := executor.NewGitNixFlakeNixOS("", false)
+	e, _ := executor.NewGitNixFlakeNixOS("", false, "")
 	bc := NewConfirmer(bk, Without, 0, "")
 	bc.Start()
 	dc := NewConfirmer(bk, Without, 0, "")
@@ -210,7 +210,7 @@ func TestDeploy(t *testing.T) {
 		return false, "profile-path", nil
 	}
 	d := deployer.New(s, deployFunc, nil, "", bk)
-	e, _ := executor.NewGitNixFlakeNixOS("", false)
+	e, _ := executor.NewGitNixFlakeNixOS("", false, "")
 	bc := NewConfirmer(bk, Without, 0, "")
 	bc.Start()
 	dc := NewConfirmer(bk, Without, 0, "")
@@ -240,7 +240,7 @@ func TestIncorrectMachineId(t *testing.T) {
 	eMock := NewExecutorMock("invalid-machine-id")
 	b := builder.New(s, eMock, bk, "repoPath", "", "", "my-machine", false, 2*time.Second, 2*time.Second)
 	d := mkDeployerMock(t)
-	e, _ := executor.NewGitNixFlakeNixOS("", false)
+	e, _ := executor.NewGitNixFlakeNixOS("", false, "")
 	bc := NewConfirmer(bk, Without, 0, "")
 	bc.Start()
 	dc := NewConfirmer(bk, Without, 0, "")
@@ -272,7 +272,7 @@ func TestCorrectMachineId(t *testing.T) {
 	eMock.evalOk <- true
 	b := builder.New(s, eMock, bk, "repoPath", "", "", "my-machine", false, 2*time.Second, 2*time.Second)
 	d := mkDeployerMock(t)
-	e, _ := executor.NewGitNixFlakeNixOS("", false)
+	e, _ := executor.NewGitNixFlakeNixOS("", false, "")
 	bc := NewConfirmer(bk, Without, 0, "")
 	bc.Start()
 	dc := NewConfirmer(bk, Without, 0, "")
@@ -304,7 +304,7 @@ func TestManagerWithDarwinConfiguration(t *testing.T) {
 	d := mkDeployerMock(t)
 
 	// Test with Darwin configuration
-	e, _ := executor.NewGitNixFlakeDarwin("", false)
+	e, _ := executor.NewGitNixFlakeDarwin("", false, "")
 	bc := NewConfirmer(bk, Without, 0, "")
 	bc.Start()
 	dc := NewConfirmer(bk, Without, 0, "")

@@ -116,4 +116,7 @@ type Configuration struct {
 	Retention             Retention       `yaml:"retention"`
 	EvalTimeout           int             `yaml:"eval_timeout"`
 	BuildTimeout          int             `yaml:"build_timeout"`
+	// FingerprintCachePath 指向 scripts/build 维护的指纹缓存 (空 = 禁用).
+	// 命中时 Eval 跳过 nix 求值, 见 internal/executor/fingerprint.go.
+	FingerprintCachePath string `yaml:"fingerprint_cache_path"`
 }

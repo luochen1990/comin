@@ -61,7 +61,7 @@ var runCmd = &cobra.Command{
 		}
 
 		var executor executorPkg.Executor
-		executor, err = executorPkg.New(cfg.RepositoryType, gitConfig.Path, gitConfig.Submodules)
+		executor, err = executorPkg.New(cfg.RepositoryType, gitConfig.Path, gitConfig.Submodules, cfg.FingerprintCachePath)
 		if err != nil {
 			logrus.Error(err)
 			os.Exit(1)

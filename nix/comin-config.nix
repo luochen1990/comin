@@ -29,6 +29,9 @@ rec {
     eval_timeout = cfg.services.comin.evalTimeout;
     build_timeout = cfg.services.comin.buildTimeout;
   }
+  // (lib.optionalAttrs (cfg.services.comin.fingerprintCachePath != null) {
+    fingerprint_cache_path = cfg.services.comin.fingerprintCachePath;
+  })
   // (lib.optionalAttrs (cfg.services.comin.sshAllowedSignersPath != null) {
     ssh_allowed_signers_path = cfg.services.comin.sshAllowedSignersPath;
   })

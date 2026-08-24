@@ -10,19 +10,23 @@ import (
 
 	"github.com/nlewo/comin/internal/utils"
 	"github.com/nlewo/comin/pkg/protobuf"
+	"github.com/sirupsen/logrus"
 )
 
 type GitNixFlake struct {
-	systemAttr     string
-	repositoryPath string
-	submodules     bool
+	systemAttr string
+	// fingerprintCachePath 指向 scripts/build 的指纹缓存 (空 = 禁用), 见 fingerprint.go.
+	fingerprintCachePath string
+	repositoryPath       string
+	submodules           bool
 }
 
-func NewGitNixFlake(systemAttr, repositoryPath string, submodules bool) (*GitNixFlake, error) {
+func NewGitNixFlake(systemAttr, repositoryPath string, submodules bool, fingerprintCachePath string) (*GitNixFlake, error) {
 	return &GitNixFlake{
-		systemAttr:     systemAttr,
-		repositoryPath: repositoryPath,
-		submodules:     submodules,
+		systemAttr:           systemAttr,
+		fingerprintCachePath: fingerprintCachePath,
+		repositoryPath:       repositoryPath,
+		submodules:           submodules,
 	}, nil
 }
 
@@ -57,6 +61,21 @@ func (n *GitNixFlake) Eval(ctx context.Context, source *protobuf.Source, stdout,
 	gitSource := source.GetGit()
 	if gitSource == nil {
 		return "", "", "", fmt.Errorf("expected Git source, got nil")
+	}
+	// 指纹缓存快路径: 部署 commit 的 tree 已被本机构建过 (outPath 在 store)
+	// 时直接复用求值结果, 跳过下面两次 nix 求值. 仅对 nixosConfigurations
+	// 生效 — 缓存生产端 (scripts/build) 只求值该 attrset. machineId 返回 ""
+	// (未设置语义, 跳过 machine-id 门禁; 等价保护是缓存按 hostname 键控,
+	// 见 fingerprint.go 头注释).
+	if n.fingerprintCachePath != "" && n.systemAttr == "nixosConfigurations" {
+		if treeHash, terr := commitTreeHash(n.repositoryPath, gitSource.SelectedCommitId); terr == nil {
+			if d, o, ok := lookupFingerprint(n.fingerprintCachePath, treeHash, gitSource.Hostname); ok {
+				logrus.Infof("nix: fingerprint cache hit: tree %s of host %s already built as %s, skipping evaluation", treeHash, gitSource.Hostname, o)
+				return d, o, "", nil
+			}
+		} else {
+			logrus.Debugf("nix: fingerprint tree hash lookup failed (falling back to eval): %s", terr)
+		}
 	}
 	flakeUrl := fmt.Sprintf("git+file://%s?dir=%s&rev=%s", n.repositoryPath, gitSource.RepositorySubdir, gitSource.SelectedCommitId)
 	if n.submodules {

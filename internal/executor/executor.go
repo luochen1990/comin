@@ -13,13 +13,15 @@ import (
 type EvalFunc func(ctx context.Context, source *protobuf.Source, stdout, stderr io.WriteCloser) (drvPath string, outPath string, machineId string, err error)
 type BuildFunc func(ctx context.Context, drvPath string, stdout, stdin io.WriteCloser) error
 
-func New(repositoryType, repositoryPath string, submodules bool) (e Executor, err error) {
+// fingerprintCachePath 参数指向 scripts/build 的指纹缓存文件; 空串禁用
+// 快路径 ( Eval 不再尝试跳过求值). 见 internal/executor/fingerprint.go.
+func New(repositoryType, repositoryPath string, submodules bool, fingerprintCachePath string) (e Executor, err error) {
 	switch repositoryType {
 	case "flake":
 		if runtime.GOOS == "darwin" {
-			return NewGitNixFlakeDarwin(repositoryPath, submodules)
+			return NewGitNixFlakeDarwin(repositoryPath, submodules, fingerprintCachePath)
 		} else {
-			return NewGitNixFlakeNixOS(repositoryPath, submodules)
+			return NewGitNixFlakeNixOS(repositoryPath, submodules, fingerprintCachePath)
 		}
 
 	case "nix":
@@ -47,14 +49,16 @@ type Executor interface {
 	IsStorePathExist(string) bool
 }
 
-func NewGitNixFlakeNixOS(repositoryPath string, submodules bool) (e Executor, err error) {
+// fingerprintCachePath 参数指向 scripts/build 的指纹缓存文件; 空串禁用
+// 快路径 ( Eval 不再尝试跳过求值). 见 internal/executor/fingerprint.go.
+func NewGitNixFlakeNixOS(repositoryPath string, submodules bool, fingerprintCachePath string) (e Executor, err error) {
 	logrus.Info("executor: creating a NixOS flake executor")
-	e, err = NewGitNixFlake("nixosConfigurations", repositoryPath, submodules)
+	e, err = NewGitNixFlake("nixosConfigurations", repositoryPath, submodules, fingerprintCachePath)
 	return
 }
-func NewGitNixFlakeDarwin(repositoryPath string, submodules bool) (e Executor, err error) {
+func NewGitNixFlakeDarwin(repositoryPath string, submodules bool, fingerprintCachePath string) (e Executor, err error) {
 	logrus.Info("executor: creating a nix-darwin flake executor")
-	e, err = NewGitNixFlake("darwinConfigurations", repositoryPath, submodules)
+	e, err = NewGitNixFlake("darwinConfigurations", repositoryPath, submodules, fingerprintCachePath)
 	return
 }
 

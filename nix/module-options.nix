@@ -107,6 +107,24 @@ in
             Maximum duration in seconds for a Nix build before comin cancels it.
           '';
         };
+        fingerprintCachePath = mkOption {
+          type = nullOr str;
+          default = null;
+          description = ''
+            Path to a fingerprint cache file maintained by an external build
+            tool (e.g. the scripts/build of the luochen1990/nixos repository).
+            The file maps git tree hashes to per-host built store paths:
+              { "<tree-hash>" = { "<hostname>" = { drvPath, outPath, ... }; }; }
+            Before evaluating a commit, comin resolves the commit tree hash
+            and looks up this cache: when the hostname entry's outPath already
+            exists in the local Nix store, both Nix evaluations (derivation
+            show and machineId) are skipped entirely, since the host provably
+            built that exact tree already.
+            Any error (missing/corrupt file, unknown tree, missing store path)
+            silently falls back to the normal evaluation path. Set to null to
+            disable. Note comin runs as root and must be able to read the file.
+          '';
+        };
         exporter = mkOption {
           description = "Options for the Prometheus exporter.";
           default = { };
