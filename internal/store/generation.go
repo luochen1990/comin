@@ -1,5 +1,8 @@
 package store
 
+// 本文件的 broker.Publish 载荷遵循 broker.Publish 的快照契约 (SSOT 见该方法
+// doc comment), 发布前一律 proto.CloneOf.
+
 import (
 	"fmt"
 	"os"
@@ -198,7 +201,7 @@ func (s *Store) GenerationEvalStarted(uuid string) error {
 
 	s.lastEvalStarted = g
 	s.generationsGC()
-	e := &protobuf.Event_EvalStarted{Generation: g}
+	e := &protobuf.Event_EvalStarted{Generation: proto.CloneOf(g)}
 	s.broker.Publish(&protobuf.Event{Type: &protobuf.Event_EvalStartedType{EvalStartedType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
 	return nil
 }
@@ -222,7 +225,7 @@ func (s *Store) GenerationEvalFinished(uuid string, drvPath, outPath, machineId 
 	g.EvalEndedAt = timestamppb.New(time.Now().UTC())
 	s.lastEvalFinished = g
 	s.generationsGC()
-	e := &protobuf.Event_EvalFinished{Generation: g}
+	e := &protobuf.Event_EvalFinished{Generation: proto.CloneOf(g)}
 	s.broker.Publish(&protobuf.Event{Type: &protobuf.Event_EvalFinishedType{EvalFinishedType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
 	return nil
 }
@@ -239,7 +242,7 @@ func (s *Store) GenerationBuildStart(uuid, reason string) error {
 	g.BuildReason = reason
 	s.lastBuildStarted = g
 	s.generationsGC()
-	e := &protobuf.Event_BuildStarted{Generation: g}
+	e := &protobuf.Event_BuildStarted{Generation: proto.CloneOf(g)}
 	s.broker.Publish(&protobuf.Event{Type: &protobuf.Event_BuildStartedType{BuildStartedType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
 	return nil
 }
@@ -273,7 +276,7 @@ func (s *Store) GenerationBuildFinished(uuid string, buildErr error) error {
 	}
 	s.lastBuildFinished = g
 	s.generationsGC()
-	e := &protobuf.Event_BuildFinished{Generation: g}
+	e := &protobuf.Event_BuildFinished{Generation: proto.CloneOf(g)}
 	s.broker.Publish(&protobuf.Event{Type: &protobuf.Event_BuildFinishedType{BuildFinishedType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
 	return nil
 }

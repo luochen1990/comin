@@ -65,6 +65,12 @@ func (b *Broker) Unsubscribe(msgCh chan *protobuf.Event) {
 	b.mu.Unlock()
 }
 
+// Publish 发布一条事件到所有订阅者.
+//
+// 快照契约 (SSOT): msg 的载荷必须是发布时刻的快照 (发布后不可变) — 不得与任何
+// 会被继续修改的对象共享指针. 消费方 (gRPC server) 会跨 goroutine 异步 marshal,
+// 活指针在 marshal 撞上并发修改时产生 "size mismatch" / 撕裂读并断开事件流.
+// 发布方负责在 Publish 前 proto.CloneOf 活载荷.
 func (b *Broker) Publish(msg *protobuf.Event) {
 	b.publishCh <- msg
 }

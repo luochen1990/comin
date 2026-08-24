@@ -13,6 +13,7 @@ import (
 	"github.com/nlewo/comin/internal/types"
 	"github.com/nlewo/comin/pkg/protobuf"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -177,6 +178,24 @@ func (s *Store) GetDeployment(uuid string) (g *protobuf.Deployment, err error) {
 	return s.deploymentGet(uuid)
 }
 
+// GetDeploymentSnapshot 线程安全: 锁内查找并返回 uuid 对应 deployment 的快照,
+// 不存在 (或 uuid 为空) 返回 nil.
+// 供跨 goroutine 消费方 (deployer.State 等) 安全读取 — 直接持有并读取
+// NewDeployment 返回的活指针会与 DeploymentStarted/Finished 的锁内写构成
+// 数据竞争 (撕裂读).
+func (s *Store) GetDeploymentSnapshot(uuid string) *protobuf.Deployment {
+	if uuid == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, err := s.deploymentGet(uuid)
+	if err != nil {
+		return nil
+	}
+	return proto.CloneOf(d)
+}
+
 func (s *Store) GetDeploymentLastest() (latest *protobuf.Deployment) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -209,7 +228,7 @@ func (s *Store) DeploymentStarted(uuid, bootedStorepath, currentStorepath string
 	}
 	d.StartedAt = timestamppb.New(time.Now().UTC())
 	d.Status = StatusToString(Running)
-	e := &protobuf.Event_DeploymentStarted{Deployment: d}
+	e := &protobuf.Event_DeploymentStarted{Deployment: proto.CloneOf(d)}
 	s.broker.Publish(&protobuf.Event{Type: &protobuf.Event_DeploymentStartedType{DeploymentStartedType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
 	s.updateDataDeployments(bootedStorepath, currentStorepath, d)
 	return nil
@@ -231,7 +250,7 @@ func (s *Store) DeploymentFinished(uuid string, deploymentErr error, cominNeedRe
 	d.EndedAt = timestamppb.New(time.Now().UTC())
 	d.RestartComin = wrapperspb.Bool(cominNeedRestart)
 	d.ProfilePath = profilePath
-	e := &protobuf.Event_DeploymentFinished{Deployment: d}
+	e := &protobuf.Event_DeploymentFinished{Deployment: proto.CloneOf(d)}
 	s.broker.Publish(&protobuf.Event{Type: &protobuf.Event_DeploymentFinishedType{DeploymentFinishedType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
 	s.updateDataDeployments(bootedStorepath, currentStorepath, d)
 	return nil

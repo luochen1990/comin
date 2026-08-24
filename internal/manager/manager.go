@@ -22,6 +22,7 @@ import (
 	"github.com/nlewo/comin/internal/store"
 	"github.com/nlewo/comin/pkg/protobuf"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -117,7 +118,11 @@ func (m *Manager) GetState() *protobuf.State {
 }
 
 func (m *Manager) toState() *protobuf.State {
-	return &protobuf.State{
+	// 聚合后整体克隆作统一兜底: 各组件 State() 现已在源头返回快照 (store 锁内
+	// CloneOf / confirmer 克隆), 此层防御未来新增组件忘记在源头快照 — State 会被
+	// server goroutine 异步 marshal (Events 初始事件 / GetState RPC), 活指针在
+	// marshal 撞上并发修改时产生 size mismatch / 撕裂读.
+	return proto.CloneOf(&protobuf.State{
 		NeedToReboot:    wrapperspb.Bool(m.rebootStatus.Any()),
 		IsSuspended:     wrapperspb.Bool(m.isSuspended),
 		Builder:         m.Builder.State(),
@@ -126,7 +131,7 @@ func (m *Manager) toState() *protobuf.State {
 		Store:           m.storage.GetState(),
 		BuildConfirmer:  m.BuildConfirmer.status(),
 		DeployConfirmer: m.DeployConfirmer.status(),
-	}
+	})
 }
 
 // RequestReboot 由 server.Reboot RPC 触发, 异步请求 manager 执行 reboot.
@@ -330,7 +335,7 @@ func (m *Manager) Run(ctx context.Context) {
 				// 语义改为 "状态翻转通知" 而非 "瞬时事实" (符合 rebootStatus 是持续状态的语义).
 				if wasEmpty && m.rebootStatus.Any() {
 					logrus.Infof("manager: reboot status flipped to true: %s", m.rebootStatus.Reason())
-					e := &protobuf.Event_RebootRequired{Deployment: dpl}
+					e := &protobuf.Event_RebootRequired{Deployment: proto.CloneOf(dpl)}
 					m.broker.Publish(&protobuf.Event{Type: &protobuf.Event_RebootRequired_{RebootRequired: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
 				}
 				// pendingChecks 清空, 等下一次 build.

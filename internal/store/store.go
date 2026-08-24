@@ -13,6 +13,7 @@ import (
 	"github.com/nlewo/comin/pkg/protobuf"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 type Store struct {
@@ -68,10 +69,14 @@ func New(broker *broker.Broker, filename, gcRootsDir string, bootEntryCapacity, 
 	return &st, nil
 }
 
+// GetState 返回 persisted 状态的快照 (锁内克隆).
+// 消费方 (manager.toState → gRPC 异步 marshal, deployer 启动恢复) 与 store 的
+// 并发修改 (持 s.mu) 之间不共享活指针 — 否则 marshal 撞上修改会产生
+// size mismatch / 撕裂读.
 func (s *Store) GetState() *protobuf.Store {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.persisted
+	return proto.CloneOf(s.persisted)
 }
 
 func (s *Store) DeploymentList() []*protobuf.Deployment {
