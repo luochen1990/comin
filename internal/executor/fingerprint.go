@@ -17,6 +17,18 @@
 // 指纹错误的最坏结果是 miss (回退正常求值). 假阳性需要 SHA-1 碰撞,
 // 可忽略. 注意: 命中时跳过 eval 也就跳过了 services.comin.machineId
 // 校验 — 等价保护来自缓存按 hostname (nixosConfigurations attr 名) 键控.
+//
+// 信任边界 (部署方需自知): 缓存文件由开发端普通用户维护 (lc 可写),
+// 命中即部署 — 即"能写该文件的用户 ≈ 持有部署审批权" (绕过 CI/审批
+// 门禁, 但不绕过 commit 签名校验, 那在 fetcher 层). 个人部署 (文件
+// 属主即 admin 本人) 下可接受; 多用户部署应在 option 文档中重估.
+//
+// 已知竞态窗口 (接受, 不防御): lookup 确认 outPath 存在后、builder 回调
+// 再次 IsStorePathExist 前, 若 GC 恰好删除该 outPath, 会以缓存中的
+// drvPath (可能为 "") 走 build 分支而失败 — 失败被记录为 BuildErr 不
+// 部署, 下一个 commit 自动恢复. 窗口 µs 级且需 GC 并发运行, 概率极低;
+// 对 DrvPath=="" 提前返回 miss 并不能消除竞态 (非空 drv 同样可能失效),
+// 反而牺牲无竞态时的有效命中, 故不做.
 package executor
 
 import (

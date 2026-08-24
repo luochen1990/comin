@@ -64,9 +64,10 @@ func (n *GitNixFlake) Eval(ctx context.Context, source *protobuf.Source, stdout,
 	}
 	// 指纹缓存快路径: 部署 commit 的 tree 已被本机构建过 (outPath 在 store)
 	// 时直接复用求值结果, 跳过下面两次 nix 求值. 仅对 nixosConfigurations
-	// 生效 — 缓存生产端 (scripts/build) 只求值该 attrset. machineId 返回 ""
-	// (未设置语义, 跳过 machine-id 门禁; 等价保护是缓存按 hostname 键控,
-	// 见 fingerprint.go 头注释).
+	// 生效 — 缓存生产端 (scripts/build) 只求值该 attrset; guard 用字段而非
+	// 参数, 与下方正常求值路径同源. machineId 返回 "" (未设置语义, 跳过
+	// machine-id 门禁; 等价保护是缓存按 hostname 键控, 见 fingerprint.go
+	// 头注释).
 	if n.fingerprintCachePath != "" && n.systemAttr == "nixosConfigurations" {
 		if treeHash, terr := commitTreeHash(n.repositoryPath, gitSource.SelectedCommitId); terr == nil {
 			if d, o, ok := lookupFingerprint(n.fingerprintCachePath, treeHash, gitSource.Hostname); ok {
