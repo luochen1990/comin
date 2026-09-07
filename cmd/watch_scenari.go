@@ -15,7 +15,7 @@ func dStarted(status string) *protobuf.Event {
 		Operation: "switch",
 		Status:    status,
 		Generation: &protobuf.Generation{
-			Uuid:   "d3b9c304-cb7d-4682-a052-57abd427e2b0",
+			Uuid: "d3b9c304-cb7d-4682-a052-57abd427e2b0",
 			Source: &protobuf.Source{
 				Source: &protobuf.Source_Git{
 					Git: &protobuf.Git{
@@ -35,7 +35,7 @@ func dFinished(status string) *protobuf.Event {
 		Operation: "switch",
 		Status:    status,
 		Generation: &protobuf.Generation{
-			Uuid:   "d3b9c304-cb7d-4682-a052-57abd427e2b0",
+			Uuid: "d3b9c304-cb7d-4682-a052-57abd427e2b0",
 			Source: &protobuf.Source{
 				Source: &protobuf.Source_Git{
 					Git: &protobuf.Git{

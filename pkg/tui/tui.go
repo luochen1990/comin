@@ -55,7 +55,7 @@ func boolToString(v bool) string {
 
 // FetcherModel holds the current fetcher state and renders it.
 type FetcherModel struct {
-	IsFetching       bool
+	IsFetching          bool
 	GitRepositoryStatus *protobuf.GitRepositoryStatus
 }
 

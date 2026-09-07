@@ -6,10 +6,10 @@ import (
 	"github.com/dustin/go-humanize"
 	"google.golang.org/protobuf/encoding/protojson"
 
-	"github.com/nlewo/comin/pkg/client"
 	"github.com/nlewo/comin/internal/deployer"
-	pb "github.com/nlewo/comin/pkg/protobuf"
 	store "github.com/nlewo/comin/internal/store"
+	"github.com/nlewo/comin/pkg/client"
+	pb "github.com/nlewo/comin/pkg/protobuf"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )

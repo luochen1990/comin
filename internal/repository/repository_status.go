@@ -1,8 +1,8 @@
 package repository
 
 import (
-	pb "github.com/nlewo/comin/pkg/protobuf"
 	"github.com/nlewo/comin/internal/types"
+	pb "github.com/nlewo/comin/pkg/protobuf"
 )
 
 func NewGitRepositoryStatus(config types.GitConfig, mainCommitId string) *pb.GitRepositoryStatus {

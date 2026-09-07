@@ -105,7 +105,7 @@ func (s *Store) NewGeneration(hostname, repositoryDir, systemAttr string, rs *pr
 	}
 
 	g = protobuf.Generation{
-		Uuid:   uuid.New().String(),
+		Uuid: uuid.New().String(),
 		Source: &protobuf.Source{
 			Source: &protobuf.Source_Git{
 				Git: &protobuf.Git{
@@ -124,7 +124,7 @@ func (s *Store) NewGeneration(hostname, repositoryDir, systemAttr string, rs *pr
 				},
 			},
 		},
-		EvalStatus: EvalInit.String(),
+		EvalStatus:  EvalInit.String(),
 		BuildStatus: BuildInit.String(),
 	}
 	s.persisted.Generations = append(s.persisted.Generations, &g)

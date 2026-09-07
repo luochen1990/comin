@@ -164,7 +164,7 @@ func (b *Builder) Stop() {
 }
 
 type Evaluator struct {
-	source     *protobuf.Source
+	source   *protobuf.Source
 	evalFunc executor.EvalFunc
 
 	drvPath   string
@@ -214,10 +214,10 @@ func (b *Builder) Eval(ctx context.Context, generation *protobuf.Generation) err
 	stdout, stderr := b.broker.GetLogger("evaluation", generation.Uuid)
 
 	evaluator := &Evaluator{
-		source:     generation.Source,
+		source:   generation.Source,
 		evalFunc: b.executor.Eval,
-		stdout:     stdout,
-		stderr:     stderr,
+		stdout:   stdout,
+		stderr:   stderr,
 	}
 	b.evaluator = NewExec(evaluator, b.evalTimeout)
 
